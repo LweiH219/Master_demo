@@ -24,13 +24,17 @@ CANIF="${1:-can0}"
 ETHIF="${2:-enp3s0}"
 NFrames="${3:-40}"
 
-# 主站工具就在本脚本同级目录（独立工程，不再依赖固件 demo 路径）
-# 用 readlink -f 解析符号链接：这样从 ~/HPM/tools/ 的软链调用时，
-# HERE 仍指向脚本真实所在的 Master_demo/，才能找到 ecat2can_master
+# 本脚本在 <项目>/scripts/ 下，主站工具在 <项目>/build/ 下。
+# 用 readlink -f 解析软链，这样从别处链接调用也能找对位置。
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-MASTER="${ECAT2CAN_MASTER:-$HERE/ecat2can_master}"
+ROOT="$(cd "$HERE/.." && pwd)"
+MASTER="${ECAT2CAN_MASTER:-$ROOT/build/ecat2can_master}"
 
-[ -x "$MASTER" ] || { echo "找不到 $MASTER，先 make" >&2; exit 2; }
+if [ ! -x "$MASTER" ]; then
+    echo "找不到 $MASTER" >&2
+    echo "请在项目根目录先跑一次：make" >&2
+    exit 2
+fi
 
 echo "== 自检 =="
 if ! ip link show "$CANIF" >/dev/null 2>&1; then

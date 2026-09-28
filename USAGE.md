@@ -35,7 +35,7 @@ Linux(本机) ──EtherCAT 1kHz──► hpm5e3kit 网关 ──CAN 1Mbps─�
 
 > 不知道该插哪路、或不确定设备在不在线，先跑：
 > ```bash
-> ./ecat2can_master <网卡> scan 3000
+> ./build/ecat2can_master <网卡> scan 3000
 > ```
 
 ## 1. 一次性准备
@@ -81,7 +81,7 @@ make run ARGS="enp3s0 --motor gm6020 --id 1 --monitor"
 > 不加的话程序会报：
 >
 > ```
-> !! 打不开网卡 enp3s0（需要 CAP_NET_RAW：sudo setcap cap_net_raw,cap_net_admin+eip ./motor_pos）
+> !! 打不开网卡 enp3s0（需要 CAP_NET_RAW：sudo setcap cap_net_raw,cap_net_admin+eip ./build/motor_pos）
 > ```
 >
 >
@@ -118,13 +118,13 @@ ip -br link show enp3s0        # 应显示 LOWER_UP
 cd ~/HPM/ecat2can/master
 
 # M3508 + C620，ID 1
-./motor_pos enp3s0 --motor m3508 --id 1 --limit 3
+./build/motor_pos enp3s0 --motor m3508 --id 1 --limit 3
 
 # GM6020，ID 1，电流模式（默认）
-./motor_pos enp3s0 --motor gm6020 --id 1 --limit 1
+./build/motor_pos enp3s0 --motor gm6020 --id 1 --limit 1
 
 # 只读监视，不输出任何驱动量
-./motor_pos enp3s0 --motor gm6020 --id 1 --monitor
+./build/motor_pos enp3s0 --motor gm6020 --id 1 --monitor
 ```
 
 启动后**默认是失能的**，屏幕底部有一行状态。敲命令**要按回车**：
@@ -355,7 +355,7 @@ GM6020 是**低转速大扭矩直驱**（额定 1.2 N·m @ 320 rpm），M3508 �
 **输出重定向到文件时**（`> log.txt`）自动退化成逐行打印，方便采集：
 
 ```bash
-./motor_pos enp3s0 --motor m3508 --limit 3 --log-ms 100 --monitor > run.log
+./build/motor_pos enp3s0 --motor m3508 --limit 3 --log-ms 100 --monitor > run.log
 ```
 
 ---
@@ -368,7 +368,7 @@ GM6020 是**低转速大扭矩直驱**（额定 1.2 N·m @ 320 rpm），M3508 �
 ### 第 1 步：只读监视，确认链路
 
 ```bash
-./motor_pos enp3s0 --motor <类型> --id <ID> --monitor
+./build/motor_pos enp3s0 --motor <类型> --id <ID> --monitor
 ```
 
 手动慢慢转电机轴，观察：
@@ -383,7 +383,7 @@ GM6020 是**低转速大扭矩直驱**（额定 1.2 N·m @ 320 rpm），M3508 �
 ### 第 2 步：小电流开环，确认方向和力度
 
 ```bash
-./motor_pos enp3s0 --motor m3508 --id 1 --limit 1
+./build/motor_pos enp3s0 --motor m3508 --id 1 --limit 1
 ```
 
 按 `e` 使能，然后：
@@ -414,7 +414,7 @@ d          立刻失能
 ### 第 4 步：逐步放大
 
 ```bash
-./motor_pos enp3s0 --motor m3508 --id 1 --limit 10 --max-rpm 2000
+./build/motor_pos enp3s0 --motor m3508 --id 1 --limit 10 --max-rpm 2000
 ```
 
 ---
@@ -498,7 +498,7 @@ e            重新使能
 `--max-rpm` 决定最大运动速度（位置环输出的限幅），也给"运动有多猛"定了上限。
 
 > 主机侧 1 kHz 的抖动还取决于内核。正经控制建议上 PREEMPT_RT，
-> 或者 `chrt -f 50 ./motor_pos ...` 提优先级。
+> 或者 `chrt -f 50 ./build/motor_pos ...` 提优先级。
 
 ---
 
@@ -522,13 +522,13 @@ e            重新使能
 
 ```bash
 # 1) 从站和 PDO 正常吗
-./ecat2can_master enp3s0 info
+./build/ecat2can_master enp3s0 info
 
 # 2) EtherCAT 链路 + 192 字节 PDO 往返
-./ecat2can_master enp3s0 loop
+./build/ecat2can_master enp3s0 loop
 
 # 3) 只收 CAN 总线反馈，把所有收到的帧原样打出来
-./ecat2can_master enp3s0 fdb
+./build/ecat2can_master enp3s0 fdb
 ```
 
 `fdb` 特别有用：它会打印**网关收到的每一帧**（含 ID、DLC、数据）。如果电机在发反馈，

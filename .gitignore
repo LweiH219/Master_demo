@@ -1,0 +1,16 @@
+# 构建产物
+build/
+compile_commands.json
+
+# 目标文件与二进制（若在源码目录里直接编译）
+*.o
+*.a
+/ecat2can_master
+/motor_pos
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

@@ -1,16 +1,18 @@
-# ecat2can_host —— ECAT2CAN 主机侧工具（独立工程）
+# Master_demo —— ECAT2CAN 主机侧工具包（完全自包含）
 
 Linux 主机侧的 EtherCAT 主站工具，配合跑**港科大 ECAT2CAN 协议**的网关从站使用。
 
-**这是一个独立工程**：不依赖任何具体的固件 demo 目录，只要从站实现的是
-192 字节 PDO 协议（见 `ecat2can_proto.h`）即可通用。
+**自包含**：SOEM 已内置在 `third_party/SOEM`，不依赖任何外部路径或环境变量 ——
+**拷到任何地方、在任何干净机器上都能一条 `make` 构建完成**。
 
 | 程序 | 用途 |
 | --- | --- |
-| **`ecat2can_master`** | 协议/链路诊断：扫描、回环、收发、复位 |
+| **`ecat2can_master`** | 协议/链路诊断：扫描、回环、收发、复位、性能基准 |
 | **`motor_pos`** | 电机位置闭环（M3508+C620 / GM6020） |
-| `can-linktest.sh` | 用 PCAN 之类的 SocketCAN 设备做 CAN 链路自测 |
+| `scripts/can-linktest.sh` | 用 PCAN 之类的 SocketCAN 设备做 CAN 链路自测 |
 | `USAGE.md` | `motor_pos` 的完整使用指南（参数、调参、排错） |
+
+**运行期只依赖系统的 `libc` / `libm`**（`ldd` 可验证），无其他动态库。
 
 ---
 
@@ -41,20 +43,68 @@ Linux 主机侧的 EtherCAT 主站工具，配合跑**港科大 ECAT2CAN 协议*
 
 ---
 
-## 3. 构建
+## 3. 目录结构
+
+```
+Master_demo/
+├── CMakeLists.txt          顶层构建（把 SOEM 作为子目录引入）
+├── Makefile                便捷包装：make / setcap / run / linktest / install
+├── README.md
+├── USAGE.md
+├── .gitignore
+├── src/
+│   ├── ecat2can_master.c   诊断工具
+│   ├── motor_pos.c         电机闭环
+│   └── ecat2can_proto.h    192 字节 PDO 协议（与从站逐位对应）
+├── scripts/
+│   └── can-linktest.sh     CAN 链路自测
+└── third_party/
+    └── SOEM/               内置 SOEM v2.0.0（仅 Linux 所需部分）
+```
+
+> **为什么把 SOEM 内联进来**：SOEM 是 CMake 工程，`add_subdirectory()` 引入后
+> 它会自己 `configure_file()` 生成 `ec_options.h`，并通过
+> `target_include_directories(PUBLIC ...)` 把 `include` / `osal` / `oshw`
+> 路径传播给链接它的目标 —— **我们不需要手写任何 `-I`**，也不需要在
+> 目标机器上预装 SOEM。
+>
+> 只保留了 Linux 平台所需的部分（`osal/linux`、`oshw/linux`），
+> 去掉 Windows/RTKernel 支持，整体 **468 KB**。
+
+---
+
+## 4. 构建
 
 ```bash
-make                 # 编译
+make                 # 编译（内部走 cmake + ninja；没有 ninja 会自动退回 make）
 make setcap          # 加 raw socket 权限（需要 sudo 密码，每次重新链接后都要跑）
 ```
 
-SOEM 依赖默认在 `~/HPM/tools/SOEM`，换位置用 `make SOEM_DIR=/path/to/SOEM`。
+**不需要先装 SOEM，也不需要 source 任何环境脚本。**
+
+### 其他目标
+
+| 命令 | 作用 |
+| --- | --- |
+| `make` | 编译两个工具到 `build/` |
+| `make setcap` | 加 raw socket 权限（逐个文件循环调用 setcap） |
+| `make run ARGS="..."` | 加权限后直接跑 `motor_pos` |
+| `make linktest ARGS="can0 enp3s0 40"` | 跑 CAN 链路自测 |
+| `make install PREFIX=/usr/local` | 安装到系统 |
+| `make clean` | 清理 |
+
+### 依赖
+
+| | |
+| --- | --- |
+| 编译期 | `cmake ≥ 3.28`、C 编译器、`ninja`（可选，没有就用 make） |
+| 运行期 | 仅 `libc` / `libm` |
 
 > ⚠️ **每次 `make` 之后必须重跑 `make setcap`** —— 重新链接会生成新文件，
 > 内核会把文件 capability 清掉。不加会报
 > `打不开网卡 enp3s0（需要 CAP_NET_RAW …）`。
 >
-> 自查：`getcap ecat2can_master` 有输出才是设上了。
+> 自查：`getcap build/ecat2can_master` 有输出才是设上了。
 
 网卡准备（EtherCAT 用裸网卡，不能被 NetworkManager 管）：
 
@@ -65,10 +115,10 @@ ip -br link show enp3s0        # 应显示 LOWER_UP
 
 ---
 
-## 4. `ecat2can_master` 用法
+## 5. `ecat2can_master` 用法
 
 ```bash
-./ecat2can_master <网卡名> <命令> [参数...]
+./build/ecat2can_master <网卡名> <命令> [参数...]
 ```
 
 | 命令 | 说明 |
@@ -87,7 +137,7 @@ ip -br link show enp3s0        # 应显示 LOWER_UP
 
 ```bash
 # ① 先扫一遍：设备到底挂在哪一路？
-./ecat2can_master enp3s0 scan 3000
+./build/ecat2can_master enp3s0 scan 3000
 #   ┌────────────┬──────────┬─────────────────────────────────┐
 #   │ 通道       │ 收到帧数 │ 出现过的 ID                     │
 #   ├────────────┼──────────┼─────────────────────────────────┤
@@ -98,11 +148,11 @@ ip -br link show enp3s0        # 应显示 LOWER_UP
 #   └────────────┴──────────┴─────────────────────────────────┘
 
 # ② 往通道 0 发一帧（找设备时可以先 workall 广播到四路）
-./ecat2can_master enp3s0 work 0 0x123 11 22 33 44 55 66 77 88
-./ecat2can_master enp3s0 workall 0x1FF 03 E8 00 00 00 00 00 00
+./build/ecat2can_master enp3s0 work 0 0x123 11 22 33 44 55 66 77 88
+./build/ecat2can_master enp3s0 workall 0x1FF 03 E8 00 00 00 00 00 00
 
 # ③ PDO 往返链路自检（不碰 CAN）
-./ecat2can_master enp3s0 loop
+./build/ecat2can_master enp3s0 loop
 ```
 
 > 💡 `scan` 的默认次数是 3000（约 3 秒）。GM6020 / C620 都是 1 kHz 上报，
@@ -110,13 +160,13 @@ ip -br link show enp3s0        # 应显示 LOWER_UP
 
 ---
 
-## 5. `motor_pos` 用法（摘要）
+## 6. `motor_pos` 用法（摘要）
 
 完整说明见 **[USAGE.md](USAGE.md)**。
 
 ```bash
-./motor_pos enp3s0 --motor gm6020 --ch 0 --id 1 --monitor   # 先只读监视
-./motor_pos enp3s0 --motor m3508  --ch 3 --id 1 --limit 10
+./build/motor_pos enp3s0 --motor gm6020 --ch 0 --id 1 --monitor   # 先只读监视
+./build/motor_pos enp3s0 --motor m3508  --ch 3 --id 1 --limit 10
 ```
 
 | 参数 | 说明 |
@@ -129,14 +179,14 @@ ip -br link show enp3s0        # 应显示 LOWER_UP
 
 ---
 
-## 6. CAN 链路自测（`can-linktest.sh`）
+## 7. CAN 链路自测（`can-linktest.sh`）
 
 用一个已知正常的 SocketCAN 设备（如 PCAN-USB）验证网关某一路的收发：
 
 ```bash
 sudo ip link set can0 type can bitrate 1000000 sample-point 0.75
 sudo ip link set can0 up
-./can-linktest.sh can0 enp3s0 40
+./scripts/can-linktest.sh can0 enp3s0 40
 ```
 
 它会自检 `can0` 的网卡层/CAN 层状态、统计 `cansend` 成败、并打印网关收到的帧。
@@ -146,7 +196,7 @@ sudo ip link set can0 up
 
 ---
 
-## 7. 排错速查
+## 8. 排错速查
 
 | 现象 | 原因 / 处理 |
 | --- | --- |
@@ -173,12 +223,60 @@ sudo ip link set can0 up
 
 ---
 
-## 8. 本工程的位置与来历
+## 9. 本工程的位置与来历
 
-本工程原先放在 KIT 固件 demo（`~/HPM/ecat2can/master/`）里，
-现已**独立**出来，位于 **`~/HPM/Master_demo/`**。
+本工程最初放在 KIT 固件 demo（`~/HPM/ecat2can/master/`）里，后来独立出来，
+**现已完全自包含**（SOEM 内联），可以整个目录拷到任何项目里单独使用。
 
-> 同仓库 `~/HPM/Tide_Ecat2CAN/master/soem_gateway_demo/` 是一份**早期骨架**，
-> 用的是另一套从未落地的 PDO 布局（下行 288B / 上行 304B），**未经硬件验证**。
-> 本工程用的是港科大 ECAT2CAN 的 **192 字节协议**，已在
-> hpm5e3ykit 单路版和 ECAN-Lite 四路版上**实测跑通**。
+> 早期还有一份 `soem_gateway_demo/` 骨架，用的是另一套从未落地的 PDO 布局
+> （下行 288B / 上行 304B），**未经硬件验证**，与本工程无关。
+> 本工程用的是港科大 ECAT2CAN 的 **192 字节协议**，已在 hpm5e3ykit 单路版和
+> ECAN-Lite 四路版上**实测跑通**。
+
+### 自包含性验证
+
+模拟"拷到别处"（只复制会提交的文件到全新目录，用 `env -i` 空环境构建）：
+
+```bash
+mkdir -p /tmp/toolkit_test
+tar -cf - --exclude=build --exclude=.git . | (cd /tmp/toolkit_test && tar -xf -)
+cd /tmp/toolkit_test && env -i PATH=/usr/bin:/bin HOME=/tmp make
+ldd build/ecat2can_master        # 只依赖 libc / libm
+```
+
+**构建成功，两个工具可直接运行** —— 项目体积 **624 KB**（不含构建产物）。
+
+
+---
+
+## 10. 许可
+
+| 部分 | 许可 |
+| --- | --- |
+| 本工具包自身代码（`src/`、`scripts/`） | 随你的项目 |
+| **内置的 SOEM（`third_party/SOEM/`）** | **GPLv3 或 RT-Labs 商业许可（双许可）** |
+
+> ⚠️ **把 SOEM 内联进本仓库，意味着分发本工具包时也要遵守 SOEM 的许可。**
+>
+> SOEM 采用 **GPLv3 / 商业许可双授权**：
+> - 如果本工具包**开源分发** → 整体按 **GPLv3** 发布即可（`LICENSE.md` 已随源码保留）
+> - 如果**闭源分发** → 需要向 [RT-Labs](https://rt-labs.com/) 购买商业许可，
+>   或**不要内联 SOEM**，改用下面的方式让用户自行获取
+>
+> 仅供内部使用、不对外分发时没有这个顾虑。
+
+### 如果不想内联 SOEM
+
+把 `third_party/SOEM` 从仓库移除，改用 CMake 的 `FetchContent` 在配置阶段自动拉取：
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(SOEM
+  GIT_REPOSITORY https://github.com/OpenEtherCATsociety/SOEM.git
+  GIT_TAG        v2.0.0)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(SOEM_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(SOEM)
+```
+
+这样仓库里不含 SOEM 源码，但**首次构建需要联网**。
