@@ -44,7 +44,7 @@ target_compile_options(motor_pos PRIVATE -Wall -Wextra)
 include(GNUInstallDirs)
 install(TARGETS ecat2can_master motor_pos RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(PROGRAMS scripts/can-linktest.sh DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(FILES README.md USAGE.md DESTINATION ${CMAKE_INSTALL_DOCDIR})
+install(FILES README.md DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 message(STATUS "")
 message(STATUS "  ECAT2CAN 主机侧工具包")

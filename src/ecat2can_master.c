@@ -821,113 +821,454 @@ static int cmd_bench_lat(fieldbus_t *fb, const char *canif, uint8_t ch,
     return 0;
 }
 
-/* ===================== looplat：双通道硬件回环延迟 ===================== *
+/* ===================== looplat：双 CAN 口回环实时性测试 ===================== *
+ *
+ * 用途：测出「主机发出 CAN 指令 → 到达 CAN 总线」所花的时间，作为控制环
+ *       实时性的参考基线，并用于 Linux 优化前后的对比。
  *
  * 前提：把两个 CAN 座子用两根线短接（CANH↔CANH、CANL↔CANL），
  *       例如 ECAN-Lite 的 CN9(通道 2) ↔ CN1(通道 3)。
  *
- * 测量的回路：
+ * 回路：
  *     主机 → EtherCAT → MCAN(tx) → 收发器 → 线 → 收发器 → MCAN(rx)
  *          → EtherCAT → 主机
  *
- * 全程经过**两个真实收发器和一段真实 CAN 总线**，不含 USB / 外部设备，
- * 是最接近实际控制回路的延迟。
+ * 为什么用这个回路：全程经过**两个真实收发器和一段真实 CAN 总线**，
+ * 不含 USB、不含外部设备 —— 正是控制回路实际承受的那一段。
+ * （用 PCAN 做接收端会把 USB 传输时间算进去，那是虚高的。）
  *
- * 精度说明：主机侧靠"尽快轮询 EtherCAT"来逼近到达时刻，所以分辨率
- * 受限于一次 EtherCAT 往返（约 60~70us）；而从站的收发是在 DC 同步
- * 中断里做的（1 kHz），所以延迟主要由**落在 DC 周期的哪个相位**决定。
+ * ── 测量方法 ─────────────────────────────────────────────────────
+ *   连续 1 kHz 收发（与真实控制环同频，不是发一次歇一会儿）：
+ *     1) 发：改 seq → 从站真的把帧发到 tx 通道
+ *     2) 收：seq 保持不变、frame_count=0 → 从站不会重发，
+ *            主机尽快轮询 EtherCAT，捕捉回声落在 rx 通道的那一刻
+ *     3) 帧里带递增序号，防止上一拍的迟到帧混进来
+ *
+ * ── 精度边界（必须知道）─────────────────────────────────────────
+ *   主机侧靠"尽快轮询"逼近到达时刻，轮询粒度 = 一次 EtherCAT 往返
+ *   （约 60~70 us），所以延迟读数有 ±33 us 量级的量化。
+ *
+ * ── 单程估算 ────────────────────────────────────────────────────
+ *   报告里给「往返 ÷ 2」作为单程参考值。回路两半不完全对称
+ *   （CAN 线那 100 多 us 只占单向），绝对值可能有 ±20% 偏差。
+ *   但**做优化前后对比时这个系统性偏差会抵消** —— 对比看的是变化量。
+ *
+ * 用法：looplat <tx通道> <rx通道> [秒数=30] [频率Hz=1000] [负载帧数=0]
+ *
+ * 负载帧数 > 0 时，每拍的 PDO 里除回环帧外再塞 N 帧（ID 0x201..），
+ * 用来模拟「同一总线上还有其他电机在 1kHz 上报」的高负载场景。
+ * 上限 16（PDO 共 17 槽，得留 1 个给回环帧）。
+ *       频率默认 1000；写 2000 可测 2 kHz 控制频率（注意往返延迟已接近 500us
+ *       的周期，很可能跨拍 —— 工具会如实报告）。
  */
-static int cmd_looplat(fieldbus_t *fb, uint8_t tx_ch, uint8_t rx_ch, int count)
+
+/* 直方图最多这么多档 */
+#define LP_MAX_BINS 20
+
+static int cmd_looplat(fieldbus_t *fb, uint8_t tx_ch, uint8_t rx_ch,
+                       int seconds, int freq_hz, int load_n)
 {
     ec_groupt *grp = fb->ctx.grouplist + 0;
     ecat2can_tx_rx_message *out = (ecat2can_tx_rx_message *)grp->outputs;
     const ecat2can_tx_rx_message *in = (const ecat2can_tx_rx_message *)grp->inputs;
     uint32_t *lat;
+    int cycles, i, n = 0, timeouts = 0;
+    uint32_t lmin = 0xFFFFFFFFu, lmax = 0, last_d = 0;
+    uint64_t lsum = 0;
+    double drift_first = 0.0, drift_last = 0.0;
+    uint64_t load_rx = 0;
+    /* 帧匹配校验 */
+    int seq_ok = 0, seq_lost = 0, seq_anomaly = 0, content_bad = 0, cross_cycle = 0;
+    int expect = 0;              /* 期望匹配到的下一拍序号 */
+    struct timespec t_start, t_end, next, last_disp;
+    double real_s;
     uint8_t data[8];
-    int i, n = 0, timeouts = 0;
+    int period_us, show_progress;
 
-    if (count < 10) count = 10;
-    lat = malloc(sizeof(uint32_t) * (size_t)count);
-    if (!lat) return 1;
+    if (seconds < 1) seconds = 10;
+    if (seconds > 3600) seconds = 3600;
+    if (freq_hz < 100) freq_hz = 100;
+    if (freq_hz > 10000) freq_hz = 10000;
+    /* 负载帧数：0 = 静默基线；上限 16 —— 因为 PDO 只有 17 个槽位，
+     * 留 1 个给回环帧，再多就会把回环帧挤出上行 PDO。 */
+    if (load_n < 0)  load_n = 0;
+    if (load_n > 16) load_n = 16;
 
-    printf("LOOPLAT：通道 %u → 线 → 通道 %u，%d 次\n", tx_ch, rx_ch, count);
-    printf("  前提：这两个座子已用 CANH/CANL 两根线短接\n\n");
+    period_us = 1000000 / freq_hz;
+    cycles = seconds * freq_hz;
 
-    for (i = 0; i < count && !g_stop; i++) {
-        struct timespec t0, t1, ts;
-        uint64_t a, b;
+    lat = malloc(sizeof(uint32_t) * (size_t)cycles);
+    if (!lat) { printf("内存不足\n"); return 1; }
+
+    printf("═══ 双 CAN 口回环实时性测试 ═══\n");
+    printf("  回路   : 主机 → EtherCAT → MCAN%u → 收发器 → 线 → 收发器 → MCAN%u → EtherCAT → 主机\n",
+           tx_ch, rx_ch);
+    printf("  参数   : %d s @ %d Hz（周期 %d us，连续收发）\n",
+           seconds, freq_hz, period_us);
+    if (period_us < 700) {
+        printf("  ⚠ 周期 %d us 已接近往返延迟量级，可能跨拍 —— 若超时率高属正常\n",
+               period_us);
+    }
+    if (load_n > 0) {
+        double fps = (double)(1 + load_n) * freq_hz;
+        printf("  总线负载: 每拍 1+%d 帧 → %.0f 帧/秒，估算占用 %.0f%%%s\n",
+               load_n, fps, fps * 120.0 / 1e6 * 100.0,
+               (fps * 120.0 / 1e6 > 1.0) ? "  ⚠️ 超过总线容量，会丢帧" : "");
+        printf("            负载帧 ID 0x201~0x%03X（贴近电机反馈的优先级）\n",
+               0x200 + load_n);
+        printf("            回环帧 ID 0x200（贴近控制指令，优先级最高）\n");
+    } else {
+        printf("  总线负载: 无（静默基线）—— 加第 6 个参数可灌负载\n");
+    }
+    printf("  轮询粒度: 约 66 us（一次 EtherCAT 往返）→ 延迟读数有 ±33 us 量化\n\n");
+
+    /*
+     * 过程显示：单行原地刷新，用 \r 回到行首 + \x1b[K 清到行尾，
+     * 所以**不会重叠**。只在 stdout 是终端时显示 —— 重定向到文件时
+     * 输出保持干净，方便做前后对比。
+     */
+    show_progress = isatty(STDOUT_FILENO);
+
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+    next = t_start;
+    clock_gettime(CLOCK_MONOTONIC, &last_disp);
+
+    for (i = 0; i < cycles && !g_stop; i++) {
+        struct timespec t0, t1, tnow, deadline;
         int guard, got = 0;
-        uint8_t marker_hi = (uint8_t)(i >> 8);
-        uint8_t marker_lo = (uint8_t)(i & 0xFF);
+        uint32_t seen_mask = 0;
+        uint8_t mhi = (uint8_t)(i >> 8), mlo = (uint8_t)(i & 0xFF);
 
-        data[0] = marker_hi; data[1] = marker_lo;
+        /*
+         * 本拍必须在「下一拍开始」之前收工。
+         * ★ 注意：tick_sleep 是先推进 next 再睡，所以每拍开始时 next 正好
+         *   等于**当前**时刻（不是下一拍）—— 截止期必须是 next + 一个周期。
+         *   早先直接拿 next 当截止期，判断每拍立即为真，轮询第一次就退出，
+         *   结果一帧都收不到（踩过）。
+         */
+        deadline = next;
+        deadline.tv_nsec += (long)period_us * 1000L;
+        while (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_nsec -= 1000000000L;
+            deadline.tv_sec++;
+        }
+
+        data[0] = mhi; data[1] = mlo;
         data[2] = 0xC3; data[3] = 0x3C;
         data[4] = data[5] = data[6] = data[7] = 0;
 
-        /* ---- 第 1 拍：把帧发到 tx 通道 ---- */
+        /* ---- 第 1 拍：回环帧 + 负载帧，同一个 PDO 里一起下发 ----
+         * 槽位 0 = 回环帧（0x200，最高优先级，先发）
+         * 槽位 1..N = 负载帧（0x201..，模拟其他电机的 1kHz 反馈） */
         memset(out, 0, ECAT2CAN_PDO_BYTES);
         out->command = WORK_MODE;
-        out->frame_count = 1;
-        out->seq = (uint8_t)i;            /* seq 变化 → 从站会真的发这一帧 */
-        build_frame(out, 0, tx_ch, 0x321, data, 8);
+        out->frame_count = (uint8_t)(1 + load_n);
+        out->seq = (uint8_t)i;              /* seq 变化 → 从站真的发这些帧 */
+        build_frame(out, 0, tx_ch, 0x200, data, 8);
+        {
+            int L;
+            for (L = 0; L < load_n; L++) {
+                uint8_t ld[8];
+                ld[0] = (uint8_t)(0xA0 + L);
+                ld[1] = (uint8_t)(i & 0xFF);
+                ld[2] = (uint8_t)(i >> 8);
+                ld[3] = (uint8_t)L;
+                ld[4] = ld[5] = ld[6] = ld[7] = 0;
+                build_frame(out, 1 + L, tx_ch, (uint32_t)(0x201 + L), ld, 8);
+            }
+        }
 
         clock_gettime(CLOCK_MONOTONIC, &t0);
         fb_roundtrip(fb);
 
-        /* ---- 后续拍：seq 不变、frame_count=0，只读不回发，尽快轮询 ---- */
+        /* ---- 后续：不下发、seq 不变，尽快轮询找回声 ----
+         * 轮询以「下一拍截止时刻」为界，绝不侵占下一拍 —— 这样即使
+         * 回环跨拍（例如 2 kHz 时周期只有 500us），也不会把时间表拖乱。*/
         for (guard = 0; guard < 200; guard++) {
             int k, nfr;
 
             memset(out, 0, ECAT2CAN_PDO_BYTES);
             out->command = WORK_MODE;
-            out->frame_count = 0;         /* ★ 不再下发，避免重复发送 */
-            out->seq = (uint8_t)i;        /* ★ seq 不变 → 从站不会重发 */
+            out->frame_count = 0;           /* ★ 不再下发 */
+            out->seq = (uint8_t)i;          /* ★ seq 不变 → 不会重发 */
 
             fb_roundtrip(fb);
-            clock_gettime(CLOCK_MONOTONIC, &ts);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
 
             nfr = (int)in->frame_count;
             if (nfr > (int)ECAT2CAN_MAX_FRAME_COUNT) nfr = (int)ECAT2CAN_MAX_FRAME_COUNT;
             for (k = 0; k < nfr; k++) {
                 const can_frame_struct *f = &in->can_frames[k];
-                if (f->can_channel == rx_ch && f->std_id == 0x321 &&
-                    f->data[0] == marker_hi && f->data[1] == marker_lo) {
+                /*
+                 * 负载帧用**位图**记录，每拍每 ID 只算一次。
+                 * ★ 不能直接累加 —— 一拍要轮询好几次，同一批帧会被重复计数
+                 *   （踩过：4 帧负载被算成 10723 帧/秒，比下发的 5000 还多）。
+                 *   每拍每 ID 至多一帧，所以"出现过的 ID 数"正好等于
+                 *   这一拍成功送到总线上的负载帧数。
+                 */
+                if (f->can_channel == rx_ch && f->std_id >= 0x201 &&
+                    f->std_id <= 0x200 + (uint32_t)load_n) {
+                    seen_mask |= 1u << (f->std_id - 0x201);
+                }
+                if (f->can_channel == rx_ch && f->std_id == 0x200 &&
+                    f->data[0] == mhi && f->data[1] == mlo) {
                     got = 1;
+                    /* 内容回读校验：这一帧的 8 个字节应当原样回来。
+                     * 标记占 [0..1]，[2..3] 是固定魔数，[4..7] 恒 0 —— 全部可校验。 */
+                    if (f->data[2] != 0xC3 || f->data[3] != 0x3C ||
+                        f->data[4] || f->data[5] || f->data[6] || f->data[7]) {
+                        content_bad++;
+                    }
                     break;
                 }
             }
             if (got) break;
-            osal_usleep(50);              /* 轻微让出，避免把 CPU 跑满 */
+
+            clock_gettime(CLOCK_MONOTONIC, &tnow);
+            if (tnow.tv_sec > deadline.tv_sec ||
+                (tnow.tv_sec == deadline.tv_sec && tnow.tv_nsec >= deadline.tv_nsec)) {
+                break;              /* 到下一拍开始时刻了，本拍放弃 */
+            }
+        }
+
+        {   /* 本拍成功送达的负载帧数 = 位图里置位的个数 */
+            uint32_t m = seen_mask;
+            while (m) { load_rx += (m & 1u); m >>= 1; }
         }
 
         if (got) {
-            a = (uint64_t)t0.tv_sec * 1000000ull + (uint64_t)t0.tv_nsec / 1000ull;
-            b = (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
-            lat[n++] = (uint32_t)(b - a);
+            uint64_t a = (uint64_t)t0.tv_sec * 1000000ull + (uint64_t)t0.tv_nsec / 1000ull;
+            uint64_t b = (uint64_t)t1.tv_sec * 1000000ull + (uint64_t)t1.tv_nsec / 1000ull;
+            uint32_t d = (uint32_t)(b - a);
+            lat[n++] = d;
+            last_d = d;
+
+            /* ── 帧匹配校验 ──
+             * 正常情况：这一拍匹配到的就是这一拍发的帧（i == expect）。
+             * 若 i > expect，说明中间有拍超时、序号断档 —— 这是**正常**的。
+             * 若 i < expect，说明匹配到了更早的帧 —— 那才是**真的认错了**。 */
+            if (i == expect)       seq_ok++;
+            else if (i > expect)   seq_lost += (i - expect);
+            else                   seq_anomaly++;
+            expect = i + 1;
+
+            /* 超过一个控制周期 = 回声晚了一整拍以上 */
+            if (d > (uint32_t)period_us) cross_cycle++;
+            lsum += d;
+            if (d < lmin) lmin = d;
+            if (d > lmax) lmax = d;
         } else {
             timeouts++;
         }
 
-        /* 每拍之间留出一点间隔，让上一次的回环帧彻底散掉 */
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        { struct timespec nx = t1; tick_sleep(&nx, 2000); }
+        /* ---- 过程显示：每 100ms 刷新一次，单行原地覆盖 ---- */
+        if (show_progress) {
+            clock_gettime(CLOCK_MONOTONIC, &tnow);
+            {
+                long ms = (tnow.tv_sec - last_disp.tv_sec) * 1000
+                        + (tnow.tv_nsec - last_disp.tv_nsec) / 1000000;
+                if (ms >= 100) {
+                    double done = (double)(tnow.tv_sec - t_start.tv_sec)
+                                + (double)(tnow.tv_nsec - t_start.tv_nsec) / 1e9;
+                    double left = (double)seconds - done;
+                    printf("\r  ⏱ %5.1f/%.0fs  剩 %5.1fs │ %6d 拍 │ 当前 %4u 最大 %4u "
+                           "均值 %5.1f us │ 超时 %d   \x1b[K",
+                           done, (double)seconds, left < 0 ? 0.0 : left,
+                           i + 1, last_d, lmax, n ? (double)lsum / n : 0.0, timeouts);
+                    fflush(stdout);
+                    last_disp = tnow;
+                }
+            }
+        }
+
+        /* 绝对时间表锁目标频率 —— 保证是「连续」，不是「发一次歇一会」 */
+        tick_sleep(&next, period_us);
+        last_d = 0;
+    }
+    if (show_progress) printf("\r\x1b[K");    /* 清掉进度行，后面接完整报告 */
+
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    real_s = (double)(t_end.tv_sec - t_start.tv_sec)
+           + (double)(t_end.tv_nsec - t_start.tv_nsec) / 1e9;
+
+    /* ================= 报告 ================= */
+    if (n == 0) {
+        printf("❌ 一次都没收到回环帧。请确认：\n");
+        printf("   1) 通道 %u 和 %u 的座子确实用两根线短接了（CANH↔CANH、CANL↔CANL）\n",
+               tx_ch, rx_ch);
+        printf("   2) 接的是 CANH 对 CANH、CANL 对 CANL（接反不通）\n");
+        free(lat);
+        return 1;
     }
 
-    printf("── 双通道硬件回环延迟（主机发出 → 回到主机）──\n");
-    if (n > 0) {
-        print_stats("回环往返", lat, n, "us");
-        printf("\n  说明：这条回路含 2 次 EtherCAT 转发 + 2 个收发器 + 总线仲裁，\n"
-               "        且从站转发发生在 1 kHz DC 同步中断里 —— 所以数值会明显\n"
-               "        大于纯 EtherCAT 往返，差额就是 CAN 侧与 DC 相位的代价。\n");
-    } else {
-        printf("  (没收到回环帧 —— 确认 %u 和 %u 两个座子真的短接了，\n"
-               "   且接的是 CANH↔CANH、CANL↔CANL)\n", tx_ch, rx_ch);
+    /*
+     * ★ 长时稳定性必须在 qsort **之前**算 —— 排序后数组就丢了时间顺序，
+     *   拿到的会变成「最小 1/4 → 最大 1/4」，那是分位数差不是漂移。
+     *   （踩过：两次跑都稳定显示 +15%，看着像热漂移，其实是这个 bug。）
+     */
+    {
+        int q = n / 4, k;
+        if (q >= 1) {
+            double f = 0, b = 0;
+            for (k = 0; k < q; k++) f += lat[k];
+            for (k = n - q; k < n; k++) b += lat[k];
+            drift_first = f / q;
+            drift_last  = b / q;
+        }
     }
-    if (timeouts) printf("  超时 %d 次\n", timeouts);
+
+    qsort(lat, (size_t)n, sizeof(uint32_t), cmp_u32);
+
+    printf("── 往返延迟 ────────────────────────────────────────────────────\n");
+    {
+        double mean = (double)lsum / n, var = 0.0;
+        int k;
+        for (k = 0; k < n; k++) { double d = (double)lat[k] - mean; var += d * d; }
+        var /= n;
+        printf("  样本     : %d / %d 次（%.2f s）\n", n, cycles, real_s);
+        printf("  最小     : %u us\n", lmin);
+        printf("  p50      : %u us\n", lat[n / 2]);
+        printf("  p90      : %u us\n", lat[(int)(n * 0.90) < n ? (int)(n * 0.90) : n - 1]);
+        printf("  p99      : %u us\n", lat[(int)(n * 0.99) < n ? (int)(n * 0.99) : n - 1]);
+        printf("  p99.9    : %u us\n", lat[(int)(n * 0.999) < n ? (int)(n * 0.999) : n - 1]);
+        printf("  最大     : %u us\n", lmax);
+        printf("  平均     : %.1f us\n", mean);
+        printf("  抖动 σ   : %.1f us\n", sqrt(var));
+    }
+
+    /* ---- 直方图（自适应分档，档边界随输出一起打印，便于复现）---- */
+    printf("\n── 延迟直方图 ──────────────────────────────────────────────────\n");
+    {
+        uint32_t lo = (lmin / 20u) * 20u;              /* 20us 对齐 */
+        uint32_t hi = ((lmax + 19u) / 20u) * 20u;
+        int nb, k;
+        int cnt[LP_MAX_BINS + 1];
+
+        if (hi <= lo) hi = lo + 20u;
+        nb = (int)((hi - lo) / 20u) + 1;
+        if (nb > LP_MAX_BINS) nb = LP_MAX_BINS;
+        memset(cnt, 0, sizeof(cnt));
+        for (k = 0; k < n; k++) {
+            int b = (int)((lat[k] - lo) / 20u);
+            if (b < 0) b = 0;
+            if (b >= nb) b = nb;                        /* 溢出档 */
+            cnt[b]++;
+        }
+        for (k = 0; k <= nb; k++) {
+            double pct = 100.0 * cnt[k] / n;
+            int bars = (int)(pct / 2.0);
+            int j;
+            if (k < nb) printf("  %5u-%5u us %7.3f%% │", lo + (uint32_t)k * 20u,
+                               lo + (uint32_t)k * 20u + 19u, pct);
+            else        printf("  %5u+    us %7.3f%% │", hi, pct);
+            for (j = 0; j < bars && j < 45; j++) putchar('#');
+            putchar('\n');
+        }
+    }
+
+    /* ---- 单程估算 ---- */
+    printf("\n── 单程估算（往返 ÷ 2）────────────────────────────────────────\n");
+    {
+        uint32_t p50 = lat[n / 2];
+        uint32_t p99 = lat[(int)(n * 0.99) < n ? (int)(n * 0.99) : n - 1];
+        printf("  p50      : %u us   =  %.2f 个控制周期（%d Hz，周期 %d us）\n",
+               p50 / 2, (double)(p50 / 2) / (double)period_us, freq_hz, period_us);
+        printf("  p99      : %u us   =  %.2f 个控制周期\n",
+               p99 / 2, (double)(p99 / 2) / (double)period_us);
+        printf("  ✅ 这就是「主机发出 CAN 指令 → 到达总线」的参考值\n");
+        printf("  ⚠ 粗略估算：回路两半不完全对称（CAN 线只占单向），绝对值可能\n");
+        printf("     有 ±20%% 偏差；但**做 Linux 优化前后对比时该偏差抵消**，\n");
+        printf("     对比看的是变化量，不受影响。\n");
+    }
+
+    /* ---- 与目标控制周期的关系 ---- */
+    printf("\n── 与 %d Hz 控制周期（%d us）的关系 ────────────────────────────\n",
+           freq_hz, period_us);
+    {
+        uint32_t p50 = lat[n / 2];
+        double rt = (double)lsum / n;
+        if ((int)p50 < period_us) {
+            printf("  往返 %.0f us < %d us   ✅ 单拍内可完成往返，不跨拍（余量 %d us）\n",
+                   rt, period_us, period_us - (int)p50);
+        } else {
+            printf("  往返 %.0f us ≥ %d us   ⚠️ 往返跨拍 —— 控制环会看到 1 拍以上滞后，\n"
+                   "                          这个频率下回环跟不上，需降频或优化\n",
+                   rt, period_us);
+        }
+    }
+
+    /* ---- 总线负载实况 ---- */
+    if (load_n > 0) {
+        double fps_total = (double)(1 + load_n) * freq_hz;   /* 含回环帧，算占用用 */
+        double fps_load  = (double)load_n * freq_hz;         /* 只算负载帧，算达成率用 */
+        double fps_rx    = (double)load_rx / real_s;
+        printf("\n── 总线负载实况 ────────────────────────────────────────────────\n");
+        printf("  总线占用 : 每拍 %d 帧 × %d Hz = %.0f 帧/秒 → 估算 %.0f%%\n",
+               1 + load_n, freq_hz, fps_total, fps_total * 120.0 / 1e6 * 100.0);
+        printf("  负载帧   : 下发 %.0f 帧/秒 → 实收 %.0f 帧/秒（达成率 %.1f%%）\n",
+               fps_load, fps_rx, fps_load > 0 ? fps_rx / fps_load * 100.0 : 0.0);
+        printf("             ★ 达成率要和「负载帧下发数」比，不能和含回环帧的总数比\n");
+        /* 达成率判据：拿负载帧自己比 */
+        if (fps_rx < fps_load * 0.5) {
+            printf("  ⚠️ 实收远低于下发 —— 总线已饱和，MCAN 发送队列积压/丢帧。\n"
+                   "     此时「延迟」只反映成功发出的那部分，实际更糟。\n");
+        } else if (fps_rx < fps_load * 0.9) {
+            printf("  ⚠️ 实收略低于下发 —— 总线接近饱和，开始丢帧。\n");
+        } else {
+            printf("  ✅ 实收≈下发，总线尚未饱和，延迟数据可信。\n");
+        }
+    }
+
+    /* ---- 帧匹配校验 ---- */
+    printf("\n── 帧匹配校验（每次往返是否都匹配到「各自那一帧」）─────────────\n");
+    printf("  唯一匹配   : %d 次（序号严格递增，就是这一拍自己发的帧）%s\n",
+           seq_ok, (seq_anomaly == 0) ? "  ✅" : "");
+    printf("  序号断档   : %d 拍（中间有拍超时，序号跳过）\n", seq_lost);
+    if (seq_lost == timeouts) {
+        printf("               ✅ 与超时数（%d）完全一致 → 断档全部来自超时，不是认错帧\n",
+               timeouts);
+    } else {
+        printf("               ⚠️ 与超时数（%d）不一致 → 有不属于超时的断档，需排查\n",
+               timeouts);
+    }
+    printf("  序号异常   : %d 次%s\n", seq_anomaly,
+           (seq_anomaly == 0) ? "  ✅ 没有把更早的帧当成这一拍" :
+           "  ❌ 匹配到了更早的帧，本次测量不可信");
+    printf("  内容回读   : %s（%d 次字节不一致）\n",
+           (content_bad == 0) ? "✅ 8 字节全部原样回来，无位错" : "❌ 存在位错",
+           content_bad);
+    printf("  跨拍测量   : %d 次%s\n", cross_cycle,
+           (cross_cycle == 0) ? "  ✅ 回声都在一个控制周期内回来" :
+           "  ⚠️ 有回声晚了一整拍以上，这些样本含跨拍时间");
+
+    /* ---- 丢帧 ---- */
+    printf("\n── 丢帧 ────────────────────────────────────────────────────────\n");
+    if (timeouts == 0) {
+        printf("  超时 0 次  ✅ 每一拍都拿到了回环\n");
+    } else {
+        printf("  超时 %d / %d 次（%.3f%%）  ← 每次 = 控制环丢一次反馈更新\n",
+               timeouts, cycles, 100.0 * timeouts / cycles);
+    }
+
+    /* ---- 长时稳定性：前后 1/4 对比 ---- */
+    printf("\n── 长时稳定性（前后 1/4 对比）──────────────────────────────────\n");
+    if (drift_first > 0 && drift_last > 0) {
+        double f = drift_first, b = drift_last;
+        printf("  前 1/4   : %.1f us\n", f);
+        printf("  后 1/4   : %.1f us\n", b);
+        printf("  漂移     : %+.2f%%%s\n", (b - f) / f * 100.0,
+               (fabs(b - f) / f < 0.05) ? "  ✅ 稳定" : "  ⚠️ 有漂移，可能是热漂移或后台负载变化");
+    }
+
+    printf("\n═══ %d Hz 基线（%d s）—— 可用作 Linux 优化前后的对比 ═══\n",
+           freq_hz, seconds);
+    printf("    对比时重点看 p99 / p99.9 / 最大 / 抖动 σ —— linux 调优主要改善**尾部**，\n");
+    printf("    只看平均往往看不出效果。\n");
 
     free(lat);
     return 0;
 }
+
 
 /* ===================== rt：实时性合格性测试 ===================== *
  *
@@ -1352,7 +1693,12 @@ static void usage(const char *prog)
            "  rt [秒数] [通道|host]   ★实时性合格性测试：直方图 / 截止期错失 / 环境诊断\n"
            "                         第二参数写 host = 纯主机模式，不需要任何硬件\n"
            "  bench_lat <通道> <can口> [次数] ★端到端延迟：主机→EtherCAT→网关→CAN总线→对端\n"
-           "  looplat <tx通道> <rx通道> [次数] ★双通道硬件回环延迟（两个座子短接后测）\n"
+           "  looplat <tx> <rx> [秒数] [Hz] [负载帧数]  ★双 CAN 口回环实时性测试（两座子短接）\n"
+           "                         默认 30 秒 @ 1000 Hz、无负载\n"
+           "                         第 6 参数灌总线负载（模拟同总线还有其他电机）\n"
+           "                         例：looplat 2 3              静默基线\n"
+           "                             looplat 2 3 30 1000 4    4 帧/拍 ≈ 60%% 负载\n"
+           "                             looplat 2 3 30 1000 8    8 帧/拍 ≈ 108%% 饱和\n"
            "  fdb  [次数]             ONLY_FDB，只读 CAN 反馈（默认 20）\n"
            "  reset                   HW_RESET，让从站复位\n"
            "\n"
@@ -1382,6 +1728,8 @@ int main(int argc, char *argv[])
     const char *can_iface = "can0";
     uint8_t tx_ch = 2, rx_ch = 3;
     int rt_host_only = 0;
+    int lp_freq = 1000;
+    int lp_load = 0;
     int len = 8, cycles = -1, rc = 0;
 
     if (argc < 3) {
@@ -1458,8 +1806,9 @@ int main(int argc, char *argv[])
     } else if (strcmp(cmd, "looplat") == 0) {
         unsigned a2, b2;
         if (argc < 5) {
-            printf("!! looplat 用法：looplat <发送通道> <接收通道> [次数]\n"
-                   "   前提：这两个座子已用 CANH/CANL 短接\n");
+            printf("!! looplat 用法：looplat <发送通道> <接收通道> [秒数=30] [Hz=1000] [负载帧数=0]\n"
+                   "   前提：这两个座子已用 CANH/CANL 短接\n"
+                   "   例：looplat 2 3 60   （通道 2 ↔ 3 回环，跑 60 秒）\n");
             return 1;
         }
         a2 = (unsigned)strtoul(argv[3], NULL, 0);
@@ -1471,7 +1820,13 @@ int main(int argc, char *argv[])
         if (a2 == b2) { printf("!! 收发通道不能相同\n"); return 1; }
         tx_ch = (uint8_t)a2;
         rx_ch = (uint8_t)b2;
-        cycles = (argc >= 6) ? atoi(argv[5]) : 200;
+        cycles = (argc >= 6) ? atoi(argv[5]) : 30;          /* 秒数，默认 30 */
+        lp_freq = (argc >= 7) ? atoi(argv[6]) : 1000;       /* 频率 Hz */
+        lp_load = (argc >= 8) ? atoi(argv[7]) : 0;          /* 负载帧数 */
+        if (lp_freq < 100 || lp_freq > 10000) {
+            printf("!! 频率必须在 100 ~ 10000 Hz\n");
+            return 1;
+        }
     } else if (strcmp(cmd, "bench_lat") == 0) {
         /* bench_lat <通道> <can口> [次数] */
         unsigned v;
@@ -1563,7 +1918,7 @@ int main(int argc, char *argv[])
     } else if (strcmp(cmd, "bench_lat") == 0) {
         rc = cmd_bench_lat(&fb, can_iface, g_can_channel, id, cycles);
     } else if (strcmp(cmd, "looplat") == 0) {
-        rc = cmd_looplat(&fb, tx_ch, rx_ch, cycles);
+        rc = cmd_looplat(&fb, tx_ch, rx_ch, cycles, lp_freq, lp_load);
     } else if (strcmp(cmd, "work") == 0) {
         rc = cmd_work(&fb, g_can_channel, id, data, len, cycles);
     } else if (strcmp(cmd, "workall") == 0) {
