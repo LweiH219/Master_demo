@@ -61,7 +61,22 @@ typedef struct {
     const char  *iface;
     uint8        map[4096];
     int          roundtrip_us;
+    int          slavecount;   /* 扫到的从站数 */
+    int          slave_idx;    /* 当前操作的从站（1..slavecount） */
 } fieldbus_t;
+
+/*
+ * 多从站：SOEM 把整个组的过程映像**按从站顺序紧凑排列** ——
+ *   输出区：[从站1 的 PDO][从站2 的 PDO]...
+ *   输入区：[从站1 的 PDO][从站2 的 PDO]...
+ * 所以第 k 个从站的 PDO 起点 = 组首地址 + (k-1) × 192。
+ *
+ * 用环境变量 ECAT2CAN_SLAVE=N 选从站，默认 1。
+ */
+#define FB_OUT(fb, grp) ((ecat2can_tx_rx_message *) \
+    ((uint8_t *)(grp)->outputs + (size_t)((fb)->slave_idx - 1) * ECAT2CAN_PDO_BYTES))
+#define FB_IN(fb, grp)  ((const ecat2can_tx_rx_message *) \
+    ((const uint8_t *)(grp)->inputs + (size_t)((fb)->slave_idx - 1) * ECAT2CAN_PDO_BYTES))
 
 static volatile sig_atomic_t g_stop = 0;
 
@@ -147,21 +162,58 @@ static int fb_start(fieldbus_t *fb)
                fb->iface);
         return 0;
     }
+    fb->slavecount = ctx->slavecount;
     printf("扫到 %d 个从站\n", ctx->slavecount);
+    for (i = 1; i <= ctx->slavecount; i++) {
+        slave = ctx->slavelist + i;
+        printf("  [%d] %-14s Man=0x%08X ID=0x%08X Rev=0x%08X\n",
+               i, slave->name, slave->eep_man, slave->eep_id, slave->eep_rev);
+    }
 
     ecx_config_map_group(ctx, fb->map, 0);
     grp = ctx->grouplist + 0;
-    printf("过程数据映射：下行 %d 字节 / 上行 %d 字节\n", grp->Obytes, grp->Ibytes);
+    printf("过程数据映射：下行 %d 字节 / 上行 %d 字节（%d 从站 × %d）\n",
+           grp->Obytes, grp->Ibytes, ctx->slavecount, ECAT2CAN_PDO_BYTES);
 
-    if (grp->Obytes != ECAT2CAN_PDO_BYTES || grp->Ibytes != ECAT2CAN_PDO_BYTES) {
-        printf("!! 期望 192/192，实际 %d/%d。请核对从站 SSC/ESI 与从站固件是否配套。\n",
-               grp->Obytes, grp->Ibytes);
+    /*
+     * 每个从站的 PDO 应当是 192 字节；整组因此是 N×192。
+     * ★ 早先这里写死 192，接两块板时会误报"从站固件不配套" —— 其实是槽位没算对。
+     */
+    {
+    int want = (int)(ECAT2CAN_PDO_BYTES * (unsigned)ctx->slavecount);
+    if ((int)grp->Obytes != want || (int)grp->Ibytes != want) {
+        printf("!! 期望 %d/%d（%d 从站 × 192），实际 %d/%d。\n",
+               ECAT2CAN_PDO_BYTES * ctx->slavecount,
+               ECAT2CAN_PDO_BYTES * ctx->slavecount,
+               ctx->slavecount, grp->Obytes, grp->Ibytes);
+        if (grp->Obytes % ECAT2CAN_PDO_BYTES != 0) {
+            printf("   总字节数不是 192 的整数倍 → 从站 PDO 尺寸和本工具不匹配，\n"
+                   "   请核对从站固件是否为 ECAT2CAN 协议。\n");
+        } else {
+            printf("   是 192 的整数倍但个数对不上 → 有从站的 PDO 尺寸不同。\n");
+        }
         return 0;
     }
+    }
+
+    /* 选从站：环境变量 ECAT2CAN_SLAVE=N，默认第 1 个 */
+    fb->slave_idx = 1;
+    {
+        const char *e = getenv("ECAT2CAN_SLAVE");
+        if (e != NULL) {
+            int v = atoi(e);
+            if (v >= 1 && v <= ctx->slavecount) {
+                fb->slave_idx = v;
+            } else {
+                printf("!! ECAT2CAN_SLAVE=%s 超范围（1..%d），仍用 1\n", e, ctx->slavecount);
+            }
+        }
+    }
+    printf("本次操作从站：%d%s（换从站用 ECAT2CAN_SLAVE=N）\n",
+           fb->slave_idx,
+           (ctx->slavecount == 1) ? "  —— 只有一个从站" : "");
 
     slave = ctx->slavelist + 1;
-    printf("从站：%s  Man=0x%08X ID=0x%08X Rev=0x%08X\n",
-           slave->name, slave->eep_man, slave->eep_id, slave->eep_rev);
 
     ecx_configdc(ctx);
 
@@ -182,8 +234,14 @@ static int fb_start(fieldbus_t *fb)
         ecx_statecheck(ctx, 0, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE / 20);
         if (slave->state == EC_STATE_OPERATIONAL) {
             printf("完成，从站已进 OP\n");
-            /* 1 ms 分布式时钟同步，和港科大实装时的 1 kHz 控制周期一致 */
-            ecx_dcsync0(ctx, 1, TRUE, 1000000, 0);
+            /* 1 ms 分布式时钟同步，和港科大实装时的 1 kHz 控制周期一致。
+             * ★ 多从站时每个都要设，否则未设的从站会各自自由跑。 */
+            for (i = 1; i <= ctx->slavecount; i++) {
+                ecx_dcsync0(ctx, i, TRUE, 1000000, 0);
+            }
+            if (ctx->slavecount > 1) {
+                printf("  已对 %d 个从站都下发 DC 同步（1 ms）\n", ctx->slavecount);
+            }
             return 1;
         }
     }
@@ -212,6 +270,7 @@ static void fb_stop(fieldbus_t *fb)
 /* ===================== 各命令 ===================== */
 static int cmd_info(fieldbus_t *fb)
 {
+    int disp_tick = 0;
     int tick = 0;
 
     while (!g_stop) {
@@ -223,12 +282,27 @@ static int cmd_info(fieldbus_t *fb)
         if (++tick % 20 == 0) {
             ecx_readstate(&fb->ctx);
         }
-        printf("往返 %3d us  WKC %d/%d  从站状态 0x%02X%s     \r",
-               fb->roundtrip_us, wkc, expected_wkc,
-               fb->ctx.slavelist[1].state,
-               (fb->ctx.slavelist[1].state == EC_STATE_OPERATIONAL) ? " (OP)" : "");
-        fflush(stdout);
-        osal_usleep(100000);
+        /*
+         * ★ 过程数据必须以 ~1 kHz 持续下发，不能几十毫秒才发一次。
+         *
+         * EtherCAT 从站的 SM 看门狗默认 100 ms：主站超过这个时间没写同步管理器，
+         * 从站就会掉出 OP、报 AL=0x001B（Sync manager watchdog），
+         * 表现为 WKC 由 3/3 掉到 1/3（SAFE-OP 下从站只读输入、不处理输出）。
+         *
+         * 早先这里是 usleep(100000) —— 刚好撞上看门狗超时，于是把
+         * 「正常工作的从站」误判成了故障。数据要发得快，显示可以慢。
+         */
+        if (++disp_tick % 100 == 0) {
+            ec_slavet *sl = &fb->ctx.slavelist[fb->slave_idx];
+            printf("往返 %3d us  WKC %d/%d  状态 0x%02X%s  AL=0x%04X %-28s\r",
+                   fb->roundtrip_us, wkc, expected_wkc,
+                   sl->state,
+                   (sl->state == EC_STATE_OPERATIONAL) ? " (OP)" : "",
+                   sl->ALstatuscode,
+                   ec_ALstatuscode2string(sl->ALstatuscode));
+            fflush(stdout);
+        }
+        osal_usleep(1000);
     }
     printf("\n");
     return 0;
@@ -334,8 +408,8 @@ static int work_channels(fieldbus_t *fb, const uint8_t *chs, int nch,
                          uint32_t id, const uint8_t *data, int len, int cycles)
 {
     ec_groupt *grp = fb->ctx.grouplist + 0;
-    ecat2can_tx_rx_message *out = (ecat2can_tx_rx_message *)grp->outputs;
-    const ecat2can_tx_rx_message *in = (const ecat2can_tx_rx_message *)grp->inputs;
+    ecat2can_tx_rx_message *out = FB_OUT(fb, grp);
+    const ecat2can_tx_rx_message *in = FB_IN(fb, grp);
     int i, k, round, last_count = -1;
 
     printf("WORK_MODE：周期 1 kHz 下发 CAN 帧（%d 次）\n", cycles);
@@ -399,8 +473,8 @@ static int cmd_workall(fieldbus_t *fb, uint32_t id, const uint8_t *data,
 static int cmd_scan(fieldbus_t *fb, int cycles)
 {
     ec_groupt *grp = fb->ctx.grouplist + 0;
-    ecat2can_tx_rx_message *out = (ecat2can_tx_rx_message *)grp->outputs;
-    const ecat2can_tx_rx_message *in = (const ecat2can_tx_rx_message *)grp->inputs;
+    ecat2can_tx_rx_message *out = FB_OUT(fb, grp);
+    const ecat2can_tx_rx_message *in = FB_IN(fb, grp);
     uint32_t cnt[ECAT2CAN_CAN_CHANNEL_COUNT];
     uint16_t ids[ECAT2CAN_CAN_CHANNEL_COUNT][SCAN_MAX_IDS];
     int nids[ECAT2CAN_CAN_CHANNEL_COUNT];
@@ -526,8 +600,8 @@ static void print_stats(const char *name, uint32_t *v, int n, const char *unit)
 static int cmd_bench(fieldbus_t *fb, int cycles, uint8_t ch)
 {
     ec_groupt *grp = fb->ctx.grouplist + 0;
-    ecat2can_tx_rx_message *out = (ecat2can_tx_rx_message *)grp->outputs;
-    const ecat2can_tx_rx_message *in = (const ecat2can_tx_rx_message *)grp->inputs;
+    ecat2can_tx_rx_message *out = FB_OUT(fb, grp);
+    const ecat2can_tx_rx_message *in = FB_IN(fb, grp);
     uint32_t *rtt, *period, *fcnt;
     int i, n = 0, nf = 0;
     uint64_t total_frames = 0, total_bytes = 0;
@@ -691,7 +765,7 @@ static int cmd_bench_lat(fieldbus_t *fb, const char *canif, uint8_t ch,
                          uint32_t id, int count)
 {
     ec_groupt *grp = fb->ctx.grouplist + 0;
-    ecat2can_tx_rx_message *out = (ecat2can_tx_rx_message *)grp->outputs;
+    ecat2can_tx_rx_message *out = FB_OUT(fb, grp);
     uint32_t *lat, *rtt;
     uint8_t data[8];
     int fd, n = 0, i, misses = 0;
@@ -869,8 +943,8 @@ static int cmd_looplat(fieldbus_t *fb, uint8_t tx_ch, uint8_t rx_ch,
                        int seconds, int freq_hz, int load_n)
 {
     ec_groupt *grp = fb->ctx.grouplist + 0;
-    ecat2can_tx_rx_message *out = (ecat2can_tx_rx_message *)grp->outputs;
-    const ecat2can_tx_rx_message *in = (const ecat2can_tx_rx_message *)grp->inputs;
+    ecat2can_tx_rx_message *out = FB_OUT(fb, grp);
+    const ecat2can_tx_rx_message *in = FB_IN(fb, grp);
     uint32_t *lat;
     int cycles, i, n = 0, timeouts = 0;
     uint32_t lmin = 0xFFFFFFFFu, lmax = 0, last_d = 0;
@@ -1553,8 +1627,8 @@ static int cmd_rt_host(int seconds)
 static int cmd_rt(fieldbus_t *fb, int seconds, uint8_t ch)
 {
     ec_groupt *grp = fb->ctx.grouplist + 0;
-    ecat2can_tx_rx_message *out = (ecat2can_tx_rx_message *)grp->outputs;
-    const ecat2can_tx_rx_message *in = (const ecat2can_tx_rx_message *)grp->inputs;
+    ecat2can_tx_rx_message *out = FB_OUT(fb, grp);
+    const ecat2can_tx_rx_message *in = FB_IN(fb, grp);
     uint32_t *per;
     int cycles, i, n = 0;
     int buck[RT_MAX_BUCKETS];
@@ -1636,8 +1710,8 @@ static int cmd_rt(fieldbus_t *fb, int seconds, uint8_t ch)
 static int cmd_fdb(fieldbus_t *fb, int cycles)
 {
     ec_groupt *grp = fb->ctx.grouplist + 0;
-    ecat2can_tx_rx_message *out = (ecat2can_tx_rx_message *)grp->outputs;
-    const ecat2can_tx_rx_message *in = (const ecat2can_tx_rx_message *)grp->inputs;
+    ecat2can_tx_rx_message *out = FB_OUT(fb, grp);
+    const ecat2can_tx_rx_message *in = FB_IN(fb, grp);
     int round, last_count = -1;
 
     printf("ONLY_FDB：只收 CAN 总线反馈，不下发（%d 次）\n", cycles);
@@ -1662,7 +1736,7 @@ static int cmd_fdb(fieldbus_t *fb, int cycles)
 static int cmd_reset(fieldbus_t *fb)
 {
     ec_groupt *grp = fb->ctx.grouplist + 0;
-    ecat2can_tx_rx_message *out = (ecat2can_tx_rx_message *)grp->outputs;
+    ecat2can_tx_rx_message *out = FB_OUT(fb, grp);
     int i;
 
     printf("HW_RESET：从站会调用看门狗强制复位（掉出 OP，约 100 ms 后重新启动）\n");
