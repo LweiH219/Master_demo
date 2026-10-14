@@ -154,7 +154,47 @@ static int fb_start(fieldbus_t *fb)
     }
     printf("网卡 %s 初始化完成\n", fb->iface);
 
-    if (ecx_config_init(ctx) <= 0) {
+    /*
+     * ★ 扫描重试。
+     *
+     * EtherCAT 的 DL 端口状态里，「有链路」和「通信已建立」是两回事：
+     *   bits = 0b01  端口打开，但没有帧通过
+     *   bits = 0b10  端口打开且通信已建立   ← 枚举需要这个
+     *
+     * 下游从站上电/复位/首次进 INIT 的过程中，它的 ESC 端口会先到 0b01，
+     * 过一会儿才到 0b10。一次性扫描很容易正好落在窗口外，只扫到前面的从站。
+     * 实测遇到过多从站时 8 次扫描只成功 1 次的情况。
+     *
+     * 所以这里重试若干次，取「找到从站最多」的那一次结果。
+     * 次数可用 ECAT2CAN_SCAN_RETRY 覆盖（默认 6，每次间隔 400 ms）。
+     */
+    {
+        int attempt, best = 0, best_attempt = 0;
+        int retry = 6;
+        const char *e = getenv("ECAT2CAN_SCAN_RETRY");
+        if (e != NULL) {
+            int v = atoi(e);
+            if (v >= 1 && v <= 50) retry = v;
+        }
+
+        for (attempt = 1; attempt <= retry; attempt++) {
+            int n = ecx_config_init(ctx);
+            if (n > best) { best = n; best_attempt = attempt; }
+            if (n > 0 && attempt == 1 && retry == 1) break;
+            if (best > 1) break;              /* 已经找到多个，不必再试 */
+            if (attempt < retry) osal_usleep(400000);
+        }
+        if (best_attempt > 1) {
+            printf("扫描重试：第 %d 次才扫到 %d 个从站（共试 %d 次）\n",
+                   best_attempt, best, retry);
+        }
+        ctx->slavecount = best;
+        if (best <= 0) {
+            printf("!! 重试 %d 次都没扫到从站。\n", retry);
+        }
+    }
+
+    if (ctx->slavecount <= 0) {
         printf("!! 没扫到从站。依次检查：\n"
                "   1) 网线插在板子的 EtherCAT 口上，且是 Port0 那个（本板 Port1 不支持）\n"
                "   2) 板子已上电且固件在跑（串口应打印 EEPROM loading successful）\n"
@@ -165,9 +205,53 @@ static int fb_start(fieldbus_t *fb)
     fb->slavecount = ctx->slavecount;
     printf("扫到 %d 个从站\n", ctx->slavecount);
     for (i = 1; i <= ctx->slavecount; i++) {
+        static const char *topo_name[] = { "无", "线端(1口)", "直通(2口)", "分支(3口)", "交叉(4口)" };
+        uint8 ap;
         slave = ctx->slavelist + i;
+
+        /* activeports：ESC 里「链路已建立且通信正常」的端口位图
+         *   bit0=port0  bit1=port1  bit2=port2  bit3=port3
+         * topology：活跃端口数（1=线端 2=直通 3=分支 4=交叉）
+         * entryport：主站从哪个口进来 */
+        ap = slave->activeports;
         printf("  [%d] %-14s Man=0x%08X ID=0x%08X Rev=0x%08X\n",
                i, slave->name, slave->eep_man, slave->eep_id, slave->eep_rev);
+        printf("      端口: 活跃=0x%X", ap);
+        if (ap) {
+            int k;
+            printf(" (");
+            for (k = 0; k < 4; k++) {
+                if (ap & (1u << k)) printf("%sport%d", (k && (ap & ((1u << k) - 1))) ? " " : "", k);
+            }
+            printf(")");
+        }
+        printf("  拓扑=%s  入口=port%d\n",
+               topo_name[slave->topology <= 4 ? slave->topology : 0], slave->entryport);
+    }
+
+    /*
+     * ★ 单从站时的「下游有链路却没枚举到」检测。
+     *
+     * activeports 是 ESC 自己报告的链路状态，**与主站枚举无关**。
+     * 所以：只扫到 1 个从站，但它的端口位图显示有 2 个活跃口 ——
+     * 说明下游物理上确实接了设备、链路也建立了，但对方**没有响应 EtherCAT 枚举**。
+     * 这是排查多从站问题时最关键的一条线索。
+     */
+    if (ctx->slavecount == 1 && ctx->slavelist[1].topology > 1) {
+        printf("\n"
+               "⚠️  下游链路存在，但从站没有被枚举到：\n"
+               "     从站1 报告 %d 个活跃端口，说明它的另一个口上确实接了设备且链路已建立，\n"
+               "     但主站扫不到它 —— 对方没有响应 EtherCAT 寻址。\n"
+               "\n"
+               "   常见原因（按可能性）：\n"
+               "     1) 下游从站的**固件没在跑** —— ESC 上电后端口未被 PDI 使能，\n"
+               "        帧进了它的 PHY 却不出 ESC。PHY 灯会亮/闪，但协议层是哑的。\n"
+               "     2) 下游从站的 EEPROM 没加载/内容不对 —— 厂家号产品号读不出来。\n"
+               "     3) 下游从站供电不足，MCU 没启动。\n"
+               "     4) 网线只通了接收对，没通发送对（半通）。\n"
+               "\n"
+               "   验证：给下游从站接串口，看有没有打印 \"EEPROM loading successful\"。\n",
+               ctx->slavelist[1].topology);
     }
 
     ecx_config_map_group(ctx, fb->map, 0);
@@ -260,7 +344,9 @@ static void fb_stop(fieldbus_t *fb)
 {
     ecx_contextt *ctx = &fb->ctx;
 
-    ecx_dcsync0(ctx, 1, FALSE, 0, 0);
+    for (int i = 1; i <= ctx->slavecount; i++) {
+        ecx_dcsync0(ctx, i, FALSE, 0, 0);
+    }
     ctx->slavelist->state = EC_STATE_INIT;
     ecx_writestate(ctx, 0);
     ecx_close(ctx);
@@ -268,6 +354,52 @@ static void fb_stop(fieldbus_t *fb)
 }
 
 /* ===================== 各命令 ===================== */
+/*
+ * 读**枚举到的从站**的 ESC 寄存器。
+ *
+ * 为什么要这个命令：ESC 的 DL_STAT / STATION_ADDR 是芯片自己维护的，
+ * 与主站软件无关。把这里的读数和用调试器直接从板子上读到的对比，
+ * 就能判断「主站连的到底是哪一块板」以及「每个端口的链路到底通没通」。
+ *
+ * STATION_ADDR 由主站在枚举时分配 —— 没被枚举到的板子，这个值恒为 0。
+ */
+static int cmd_regs(fieldbus_t *fb)
+{
+    ecx_contextt *ctx = &fb->ctx;
+    ec_slavet *sl = &ctx->slavelist[fb->slave_idx];
+    uint16 adp = sl->configadr;
+    uint16 station, dlstat, alstat, alcode;
+    uint16 pdesc16;
+    uint8  pdesc;
+    int k;
+
+    printf("从站 %d 的 ESC 寄存器（configadr=0x%04X）\n", fb->slave_idx, adp);
+
+    station = ecx_FPRDw(&ctx->port, adp, 0x0010, EC_TIMEOUTRET);
+    pdesc16 = ecx_FPRDw(&ctx->port, adp, 0x0007, EC_TIMEOUTRET);
+    pdesc   = (uint8)pdesc16;
+    dlstat  = ecx_FPRDw(&ctx->port, adp, 0x0110, EC_TIMEOUTRET);
+    alstat  = ecx_FPRDw(&ctx->port, adp, 0x0130, EC_TIMEOUTRET);
+    alcode  = ecx_FPRDw(&ctx->port, adp, 0x0134, EC_TIMEOUTRET);
+
+    printf("  STATION_ADDR = 0x%04X%s\n", station,
+           (station == 0) ? "   ← 0 = 主站没分配过地址" : "   ← 主站枚举时分配的");
+    printf("  PORT_DESC    = 0x%02X\n", pdesc);
+    printf("  DL_STAT      = 0x%04X\n", dlstat);
+    for (k = 0; k < 4; k++) {
+        unsigned v = (dlstat >> (8 + 2 * k)) & 3u;
+        printf("    port%d: bits[%d:%d] = 0b%02u  %s\n", k, 9 + 2 * k, 8 + 2 * k, v,
+               (v == 2) ? "✅ 链路已建立且通信正常" :
+               (v == 1) ? "❌ 未建立" : "   (无此端口/关闭)");
+    }
+    printf("  AL_STAT      = 0x%04X\n", alstat);
+    printf("  AL_STAT_CODE = 0x%04X  %s\n", alcode, ec_ALstatuscode2string(alcode));
+    printf("\n");
+    printf("  对照用法：接上调试器直接读同一块板子的 0xF1700110(低16位) / 0xF1700010，\n"
+           "  两处读数一致 → 主站连的就是这块板。\n");
+    return 0;
+}
+
 static int cmd_info(fieldbus_t *fb)
 {
     int disp_tick = 0;
@@ -326,8 +458,8 @@ static int cmd_loop(fieldbus_t *fb, int cycles)
     memset(prev, 0, sizeof(prev));
 
     for (round = 0; round < cycles && !g_stop; round++) {
-        uint8_t *out = grp->outputs;
-        uint8_t *in = grp->inputs;
+        uint8_t *out = (uint8_t *)FB_OUT(fb, grp);
+        const uint8_t *in = (const uint8_t *)FB_IN(fb, grp);
         ecat2can_tx_rx_message *m = (ecat2can_tx_rx_message *)out;
         int wkc;
 
@@ -349,14 +481,27 @@ static int cmd_loop(fieldbus_t *fb, int cycles)
             continue;
         }
 
-        /* 本轮的上行应该等于上一轮的下行（第 0 轮没有上一轮，跳过） */
+        /*
+         * 本轮的上行应该等于上一轮的下行（第 0 轮没有上一轮，跳过）。
+         *
+         * ★ 但要跳过 5 字节协议头里【从站自己拥有】的字段：
+         *     offset 2 = seq          从站自己的发送序号，逐帧递增
+         *     offset 3 = status       从站反馈状态
+         *     offset 4 = error_flags  从站反馈错误标志
+         *   command / frame_count 是主站下发的，从站原样保留 → 要参与比对。
+         *
+         * 早先这里 memcmp 整个 192 字节，把从站的 seq 和主站下发的 seq 对比，
+         * 两者本来就不同源，于是偶发差 1 就误报「不一致」——
+         * 实测每 150 轮左右误报一次。
+         */
         if (round > 0) {
+            int diff = 0, first = -1;
             compared++;
-            if (memcmp(prev, in, ECAT2CAN_PDO_BYTES) != 0) {
-                int first = -1;
-                for (i = 0; i < (int)ECAT2CAN_PDO_BYTES; i++) {
-                    if (prev[i] != in[i]) { first = i; break; }
-                }
+            for (i = 0; i < (int)ECAT2CAN_PDO_BYTES; i++) {
+                if (i == 2 || i == 3 || i == 4) continue;   /* 从站拥有的字段 */
+                if (prev[i] != in[i]) { diff = 1; first = i; break; }
+            }
+            if (diff) {
                 printf("  第 %d 轮不一致：首个不同字节 offset=%d 上轮下行=0x%02X 本轮上行=0x%02X\n",
                        round, first, prev[first], in[first]);
                 bad++;
@@ -438,7 +583,7 @@ static int work_channels(fieldbus_t *fb, const uint8_t *chs, int nch,
         if (round < 5 || in->frame_count != last_count ||
             in->status != ECAT2CAN_STATUS_OK || in->error_flags != 0) {
             printf("第 %4d 轮  往返 %d us\n", round, fb->roundtrip_us);
-            dump_input_pdo(grp->inputs);
+            dump_input_pdo((const uint8_t *)in);
             last_count = in->frame_count;
         }
         osal_usleep(1000);
@@ -975,8 +1120,15 @@ static int cmd_looplat(fieldbus_t *fb, uint8_t tx_ch, uint8_t rx_ch,
     if (!lat) { printf("内存不足\n"); return 1; }
 
     printf("═══ 双 CAN 口回环实时性测试 ═══\n");
-    printf("  回路   : 主机 → EtherCAT → MCAN%u → 收发器 → 线 → 收发器 → MCAN%u → EtherCAT → 主机\n",
-           tx_ch, rx_ch);
+    if (tx_ch == rx_ch) {
+        printf("  回路   : 主机 → EtherCAT → MCAN%u → 片内回环 → MCAN%u → EtherCAT → 主机\n",
+               tx_ch, rx_ch);
+        printf("           ★ 同通道回环：需要从站处于 MCAN 外部回环模式，\n"
+               "             路径里没有收发器和线缆，测得的是「主机↔从站」这一段。\n");
+    } else {
+        printf("  回路   : 主机 → EtherCAT → MCAN%u → 收发器 → 线 → 收发器 → MCAN%u → EtherCAT → 主机\n",
+               tx_ch, rx_ch);
+    }
     printf("  参数   : %d s @ %d Hz（周期 %d us，连续收发）\n",
            seconds, freq_hz, period_us);
     if (period_us < 700) {
@@ -1725,7 +1877,7 @@ static int cmd_fdb(fieldbus_t *fb, int cycles)
 
         if (round < 5 || in->frame_count != last_count) {
             printf("第 %4d 轮  往返 %d us\n", round, fb->roundtrip_us);
-            dump_input_pdo(grp->inputs);
+            dump_input_pdo((const uint8_t *)in);
             last_count = in->frame_count;
         }
         osal_usleep(1000);
@@ -1758,6 +1910,7 @@ static void usage(const char *prog)
 {
     printf("用法: %s <网卡名> <命令> [参数...]\n"
            "\n"
+           "  regs                    ★读 ESC 寄存器（DL_STAT / STATION_ADDR）判断链路与身份\n"
            "  info                    进 OP，打印从站信息并周期刷新（Ctrl+C 退出）\n"
            "  loop [次数]             LOOP_TEST，192 字节往返一致性校验（默认 1000）\n"
            "  scan [次数]             ★多通道扫描：只看不发，统计各路收帧数与出现过的 ID\n"
@@ -1891,7 +2044,15 @@ int main(int argc, char *argv[])
             printf("!! 通道号必须在 0..%u\n", ECAT2CAN_CAN_CHANNEL_MAX);
             return 1;
         }
-        if (a2 == b2) { printf("!! 收发通道不能相同\n"); return 1; }
+        /*
+         * 允许收发同通道 —— 从站若配成 MCAN 外部回环模式
+         * （can_config.mode = mcan_mode_loopback_external），
+         * 每一路会自己发、自己收，此时「同通道回环」是唯一能通的方式，
+         * 可以用来在**没有收发器、没有接线**的情况下测延迟。
+         *
+         * 正常模式下同通道当然收不到（节点不收自己发的帧），
+         * 那种情况会在跑完后报「一次都没收到」，提示里已说明。
+         */
         tx_ch = (uint8_t)a2;
         rx_ch = (uint8_t)b2;
         cycles = (argc >= 6) ? atoi(argv[5]) : 30;          /* 秒数，默认 30 */
@@ -1946,6 +2107,8 @@ int main(int argc, char *argv[])
         cycles = (argc >= 4) ? atoi(argv[3]) : 1000;
     } else if (strcmp(cmd, "fdb") == 0) {
         cycles = (argc >= 4) ? atoi(argv[3]) : 20;
+    } else if (strcmp(cmd, "regs") == 0) {
+        cycles = 0;
     } else if (strcmp(cmd, "info") == 0) {
         cycles = 0;
     } else if (strcmp(cmd, "reset") == 0) {
@@ -2001,7 +2164,9 @@ int main(int argc, char *argv[])
         rc = cmd_fdb(&fb, cycles);
     } else if (strcmp(cmd, "reset") == 0) {
         rc = cmd_reset(&fb);
-    } else {
+    } else if (strcmp(cmd, "regs") == 0) {
+        rc = cmd_regs(&fb);
+    } else if (strcmp(cmd, "info") == 0) {
         rc = cmd_info(&fb);
     }
 
