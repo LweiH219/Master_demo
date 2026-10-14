@@ -1816,6 +1816,235 @@ static int cmd_looplat_multi(fieldbus_t *fb, const int *slave_list, int nslave,
 }
 
 
+/* ===================== canloop：跨从站 CAN 回环 ===================== *
+ *
+ * 用法：canloop <发送从站> <发送通道> <接收从站> <接收通道> [秒数=30] [Hz=1000]
+ *   例：canloop 1 0 2 0 30 1000    （1 号从站的 CAN0 发 → 2 号从站的 CAN0 收）
+ *
+ * 用途：模拟真实的多轴场景 —— 多个 ECAT2CAN 从站挂在同一条 CAN 总线上，
+ *       一个从站发指令，另一个从站收。
+ *
+ * ⚠ 和 looplat（同从站内 CAN0↔CAN2 回环）的本质区别：
+ *   同从站回环能在【同一个 EtherCAT 周期】内完成（回声写回本从站的上行 PDO，
+ *   主站轮询几次就拿到了）。
+ *   跨从站回环【必然跨拍】：A 发的帧被 B 收到后，要等主站的
+ *   【下一拍 EtherCAT 帧】到达 B 才能把数据取回，所以至少要 2 个周期。
+ *   1 kHz 下这意味着约 2 ms 的端到端延迟 —— 这是物理决定的，软件优化不掉。
+ *
+ * 匹配方式：跨从站时回声的序号必然是【过去某一拍】的，不能只认本拍。
+ *   所以保存最近 CL_WIN 拍的发送时刻，收到序号 S 的帧时反查它的发送时刻，
+ *   得到真实的端到端延迟。
+ */
+#define CL_WIN 256                  /* 记住最近这么多拍的发送时刻 */
+
+static int cmd_canloop(fieldbus_t *fb, int tx_slave, uint8_t tx_ch,
+                       int rx_slave, uint8_t rx_ch,
+                       int seconds, int freq_hz)
+{
+    ec_groupt *grp = fb->ctx.grouplist + 0;
+    struct timespec cl_send[CL_WIN];
+    unsigned char cl_valid[CL_WIN];
+    uint32_t *lat;
+    int cycles, i, k, n = 0, period_us;
+    int got_any = 0, ecat_to = 0, no_echo = 0;
+    uint64_t lsum = 0;
+    uint32_t lmin = 0xFFFFFFFFu, lmax = 0;
+    struct timespec t_start, t_end, next;
+    double real_s;
+
+    if (tx_slave < 1 || tx_slave > fb->ctx.slavecount ||
+        rx_slave < 1 || rx_slave > fb->ctx.slavecount) {
+        printf("!! 从站号必须在 1..%d\n", fb->ctx.slavecount);
+        return 1;
+    }
+    if (tx_slave == rx_slave && tx_ch == rx_ch) {
+        printf("!! 同从站同通道收不到自己的帧，请用 looplat\n");
+        return 1;
+    }
+    if (seconds < 1) seconds = 10;
+    if (freq_hz < 100) freq_hz = 100;
+    if (freq_hz > 10000) freq_hz = 10000;
+    period_us = 1000000 / freq_hz;
+    cycles = seconds * freq_hz;
+
+    lat = malloc(sizeof(uint32_t) * (size_t)(cycles > 0 ? cycles : 1));
+    if (lat == NULL) { printf("!! 内存不足\n"); return 1; }
+    memset(cl_valid, 0, sizeof(cl_valid));
+
+    printf("\n═══ 跨从站 CAN 回环（canloop）═══\n");
+    printf("  发送     : 从站 #%d 的 CAN%u\n", tx_slave, tx_ch);
+    printf("  接收     : 从站 #%d 的 CAN%u\n", rx_slave, rx_ch);
+    printf("  参数     : %d s @ %d Hz（周期 %d us）\n", seconds, freq_hz, period_us);
+    printf("  前提     : 两个从站的 CAN%u 座子接在【同一条 CAN 总线】上\n", tx_ch);
+    printf("  ⚠ 预期   : 跨从站回环必然跨拍，端到端延迟至少 1 个 EtherCAT 周期\n");
+    printf("             （%d us），1 kHz 下约 2 ms —— 这是物理决定的\n", period_us);
+
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+    next = t_start;
+
+    for (i = 0; i < cycles && !g_stop; i++) {
+        uint8_t mhi = (uint8_t)(i >> 8), mlo = (uint8_t)(i & 0xFF);
+        ecat2can_tx_rx_message *o;
+
+        /* 发送从站：放一帧回环帧（ID 0x200，数据里带本拍序号）*/
+        o = FB_OUT_N(fb, grp, tx_slave);
+        memset(o, 0, ECAT2CAN_PDO_BYTES);
+        o->command     = WORK_MODE;
+        o->frame_count = 1;
+        o->seq         = (uint8_t)i;
+        o->can_frames[0].can_channel = tx_ch;
+        o->can_frames[0].std_id      = 0x200;
+        o->can_frames[0].dlc         = 8;
+        o->can_frames[0].data[0]     = mhi;
+        o->can_frames[0].data[1]     = mlo;
+        o->can_frames[0].data[2]     = 0xC3;
+        o->can_frames[0].data[3]     = 0x3C;
+
+        /* 接收从站：这拍不发，只收 */
+        if (rx_slave != tx_slave) {
+            o = FB_OUT_N(fb, grp, rx_slave);
+            memset(o, 0, ECAT2CAN_PDO_BYTES);
+            o->command     = WORK_MODE;
+            o->frame_count = 0;
+            o->seq         = (uint8_t)i;
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &cl_send[i % CL_WIN]);
+        cl_valid[i % CL_WIN] = 1;
+
+        if (fb_roundtrip(fb) < 0) { ecat_to++; tick_sleep(&next, period_us); continue; }
+
+        /*
+         * ★ 循环轮询，而不是只读一次。
+         *
+         * 接收从站把 CAN 收到的帧放进上行 PDO 需要一点时间（CAN 接收中断 →
+         * 组 PDO），所以回声往往不在第一次往返里就绪。looplat 是这么轮询的，
+         * 这里也必须一样 —— 否则会把"同一条链路"测出成倍的延迟
+         * （实测过：同样 CAN0→CAN2 的路径，只读一次得 2139us，轮询得 528us）。
+         *
+         * 轮询以【下一拍开始时刻】为界，绝不侵占下一拍。
+         * 匹配时接受"过去发过的任意一拍"的序号 —— 跨从站时回声可能晚一两拍，
+         * 反查它的发送时刻才能得到真实端到端延迟。
+         */
+        {
+            struct timespec cl_deadline = next;
+            cl_deadline.tv_nsec += (long)period_us * 1000L;
+            while (cl_deadline.tv_nsec >= 1000000000L) {
+                cl_deadline.tv_nsec -= 1000000000L;
+                cl_deadline.tv_sec++;
+            }
+
+            for (k = 0; k < 200; k++) {
+                int got_this = 0;
+
+                /* 接收从站这拍不下发，只读；发送从站也停下，避免重复发帧 */
+                if (tx_slave != rx_slave) {
+                    ecat2can_tx_rx_message *o2 = FB_OUT_N(fb, grp, tx_slave);
+                    memset(o2, 0, ECAT2CAN_PDO_BYTES);
+                    o2->command = WORK_MODE;
+                    o2->frame_count = 0;
+                    o2->seq = (uint8_t)i;
+                }
+                {
+                    ecat2can_tx_rx_message *o2 = FB_OUT_N(fb, grp, rx_slave);
+                    memset(o2, 0, ECAT2CAN_PDO_BYTES);
+                    o2->command = WORK_MODE;
+                    o2->frame_count = 0;
+                    o2->seq = (uint8_t)i;
+                }
+
+                if (fb_roundtrip(fb) < 0) { ecat_to++; break; }
+
+                {
+                    const ecat2can_tx_rx_message *in = FB_IN_N(fb, grp, rx_slave);
+                    int nfr = (int)in->frame_count;
+                    if (nfr > (int)ECAT2CAN_MAX_FRAME_COUNT) nfr = (int)ECAT2CAN_MAX_FRAME_COUNT;
+                    for (k = 0; k < nfr; k++) {
+                        const can_frame_struct *f = &in->can_frames[k];
+                        int sent_seq, slot;
+                        if (f->can_channel != rx_ch || f->std_id != 0x200) continue;
+                        if (f->data[2] != 0xC3 || f->data[3] != 0x3C) continue;
+                        sent_seq = ((int)f->data[0] << 8) | (int)f->data[1];
+                        slot = sent_seq % CL_WIN;
+                        if (sent_seq < 0 || sent_seq >= cycles) continue;
+                        if (!cl_valid[slot] || ((uint32_t)sent_seq) > (uint32_t)i) continue;
+                        {
+                            struct timespec tnow2;
+                            uint32_t d;
+                            clock_gettime(CLOCK_MONOTONIC, &tnow2);
+                            d = (uint32_t)((tnow2.tv_sec - cl_send[slot].tv_sec) * 1000000
+                                         + (tnow2.tv_nsec - cl_send[slot].tv_nsec) / 1000);
+                            if (n < cycles) lat[n++] = d;
+                            lsum += d;
+                            if (d < lmin) lmin = d;
+                            if (d > lmax) lmax = d;
+                            got_any = 1;
+                            if (sent_seq == i) got_this = 1;
+                        }
+                    }
+                }
+                if (got_this) break;        /* 本拍就回来了，不必再轮询 */
+
+                {
+                    struct timespec tnow3;
+                    clock_gettime(CLOCK_MONOTONIC, &tnow3);
+                    if (tnow3.tv_sec > cl_deadline.tv_sec ||
+                        (tnow3.tv_sec == cl_deadline.tv_sec &&
+                         tnow3.tv_nsec >= cl_deadline.tv_nsec)) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        tick_sleep(&next, period_us);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    real_s = (t_end.tv_sec - t_start.tv_sec) + (t_end.tv_nsec - t_start.tv_nsec) / 1e9;
+
+    printf("\n── 结果（%d 拍 / %.1f 秒）─────────────────────────────────\n", cycles, real_s);
+    if (n == 0) {
+        const ecat2can_tx_rx_message *di = FB_IN_N(fb, grp, rx_slave);
+        int dn = (int)di->frame_count, dj;
+        if (dn > (int)ECAT2CAN_MAX_FRAME_COUNT) dn = (int)ECAT2CAN_MAX_FRAME_COUNT;
+        printf("  ❌ 接收从站 #%d 一次都没上报 0x200 帧。\n", rx_slave);
+        printf("     当前上报 %d 条：\n", dn);
+        for (dj = 0; dj < dn && dj < 8; dj++) {
+            const can_frame_struct *df = &di->can_frames[dj];
+            printf("       [%d] 通道 CAN%u ID=0x%03X DLC=%u\n",
+                   dj, df->can_channel, df->std_id, df->dlc);
+        }
+        printf("     请确认：\n");
+        printf("       1) 两个从站的 CAN%u 是否真的接在【同一条总线】上\n", tx_ch);
+        printf("       2) 总线两端是否有 120Ω 终端电阻（跨板时通常两端各一个）\n");
+        printf("       3) CANH↔CANH、CANL↔CANL，两根线都接\n");
+        no_echo = 1;
+    } else {
+        qsort(lat, (size_t)n, sizeof(uint32_t), cmp_u32);
+        printf("  端到端延迟            : %d 个样本\n", n);
+        printf("    p50  : %u us\n", lat[(int)(n * 0.50)]);
+        printf("    p90  : %u us\n", lat[(int)(n * 0.90)]);
+        printf("    p99  : %u us\n", lat[(int)((n - 1) * 0.99)]);
+        printf("    max  : %u us\n", lmax);
+        printf("    平均 : %.1f us\n", (double)lsum / n);
+        printf("  期望拍数 %d，实际收到 %d 次 → 成功率 %.2f%%\n",
+               cycles, n, 100.0 * n / (cycles ? cycles : 1));
+        printf("  EtherCAT 侧超时       : %d 次\n", ecat_to);
+        printf("\n  判读：\n");
+        printf("    · p50 ≈ %d us（1 个周期）→ 回声下一拍就回来了，正常 ✓\n", period_us);
+        printf("    · p50 ≈ %d us（2 个周期）→ 跨了 2 拍，说明接收从站的\n", period_us * 2);
+        printf("        CAN 接收和上行 PDO 组装之间还差一拍\n");
+        printf("    · 成功率明显低于 100%% → 吞吐跟不上，降低频率或减少 CAN 负载\n");
+    }
+    printf("已请求 INIT 状态并关闭网卡\n");
+
+    free(lat);
+    (void)got_any; (void)no_echo;
+    return 0;
+}
+
+
 /* ===================== rt：实时性合格性测试 ===================== *
  *
  * 与 bench 的区别：
@@ -2279,6 +2508,9 @@ int main(int argc, char *argv[])
     /* looplat2：多从站同时回环，从站列表形如 "1,2" 或 "1-3" */
     int lp2_slaves[8];
     int lp2_nslave = 0;
+    /* canloop：跨从站 CAN 回环 */
+    int cl_tx_slave = 1, cl_rx_slave = 2;
+    uint8_t cl_tx_ch = 0, cl_rx_ch = 0;
     int lp_load = 0;
     int len = 8, cycles = -1, rc = 0;
 
@@ -2353,6 +2585,35 @@ int main(int argc, char *argv[])
         cycles = 2000;
     } else if (strcmp(cmd, "scan") == 0) {
         cycles = (argc >= 4) ? atoi(argv[3]) : 3000;
+    } else if (strcmp(cmd, "canloop") == 0) {
+        /* canloop <发送从站> <发送通道> <接收从站> <接收通道> [秒] [Hz] */
+        int ts, tc, rs, rc;
+        if (argc < 7) {          /* 需要 argv[3..6] 四个参数 */
+
+            printf("!! canloop 用法：canloop <发送从站> <发送通道> <接收从站> <接收通道> [秒数=30] [Hz=1000]\n"
+                   "   例：canloop 1 0 2 0 30 1000\n"
+                   "       （1 号从站的 CAN0 发 → 2 号从站的 CAN0 收）\n"
+                   "   ⚠ 两个从站的该通道要接在【同一条 CAN 总线】上\n"
+                   "   ⚠ 跨从站回环必然跨拍，延迟至少 1 个 EtherCAT 周期\n");
+            return 1;
+        }
+        ts = atoi(argv[3]);
+        tc = atoi(argv[4]);
+        rs = atoi(argv[5]);
+        rc = atoi(argv[6]);
+        if (tc < 0 || tc > (int)ECAT2CAN_CAN_CHANNEL_MAX ||
+            rc < 0 || rc > (int)ECAT2CAN_CAN_CHANNEL_MAX) {
+            printf("!! 通道号必须在 0..%u\n", ECAT2CAN_CAN_CHANNEL_MAX);
+            return 1;
+        }
+        cl_tx_slave = ts; cl_tx_ch = (uint8_t)tc;
+        cl_rx_slave = rs; cl_rx_ch = (uint8_t)rc;
+        cycles  = (argc >= 8) ? atoi(argv[7]) : 30;
+        lp_freq = (argc >= 9) ? atoi(argv[8]) : 1000;
+        if (lp_freq < 100 || lp_freq > 10000) {
+            printf("!! 频率必须在 100 ~ 10000 Hz\n");
+            return 1;
+        }
     } else if (strcmp(cmd, "looplat2") == 0) {
         unsigned a2, b2;
         char *p;
@@ -2529,6 +2790,9 @@ int main(int argc, char *argv[])
         rc = cmd_bench_lat(&fb, can_iface, g_can_channel, id, cycles);
     } else if (strcmp(cmd, "looplat") == 0) {
         rc = cmd_looplat(&fb, tx_ch, rx_ch, cycles, lp_freq, lp_load);
+    } else if (strcmp(cmd, "canloop") == 0) {
+        rc = cmd_canloop(&fb, cl_tx_slave, cl_tx_ch, cl_rx_slave, cl_rx_ch,
+                         cycles, lp_freq);
     } else if (strcmp(cmd, "looplat2") == 0) {
         int q, bad = 0;
         for (q = 0; q < lp2_nslave; q++) {
