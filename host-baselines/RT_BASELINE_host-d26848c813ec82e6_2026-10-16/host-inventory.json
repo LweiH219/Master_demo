@@ -1,0 +1,233 @@
+{
+  "schema": 1,
+  "captured_utc": "2026-10-16T11:16:41.293779+00:00",
+  "host_id": "host-d26848c813ec82e6",
+  "identity_sha256": "d26848c813ec82e6c5845e7a1ba8c90929a5f44b5262d1d888efa7f3010a6168",
+  "identity_basis": "DMI product_uuid",
+  "dmi": {
+    "sys_vendor": "Thunderobot",
+    "product_name": "MIX NUC II",
+    "product_version": "V1.0",
+    "board_vendor": "Thunderobot",
+    "board_name": "Thunderobot MIX NUC II",
+    "board_version": "V1.0",
+    "bios_vendor": "American Megatrends International, LLC.",
+    "bios_version": "5.27",
+    "bios_date": "08/21/2025"
+  },
+  "inventory": {
+    "hostname": {
+      "exit": 0,
+      "output": "tide"
+    },
+    "os": {
+      "exit": 0,
+      "output": "PRETTY_NAME=\"Ubuntu 24.04.5 LTS\"\nNAME=\"Ubuntu\"\nVERSION_ID=\"24.04\"\nVERSION=\"24.04.5 LTS (Noble Numbat)\"\nVERSION_CODENAME=noble\nID=ubuntu\nID_LIKE=debian\nHOME_URL=\"https://www.ubuntu.com/\"\nSUPPORT_URL=\"https://help.ubuntu.com/\"\nBUG_REPORT_URL=\"https://bugs.launchpad.net/ubuntu/\"\nPRIVACY_POLICY_URL=\"https://www.ubuntu.com/legal/terms-and-policies/privacy-policy\"\nUBUNTU_CODENAME=noble\nLOGO=ubuntu-logo"
+    },
+    "kernel": {
+      "exit": 0,
+      "output": "Linux tide 6.8.1-1060-realtime #61-Ubuntu SMP PREEMPT_RT Fri Sep  4 19:49:14 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux"
+    },
+    "cmdline": {
+      "exit": 0,
+      "output": "BOOT_IMAGE=/boot/vmlinuz-6.8.1-1060-realtime root=UUID=580f461c-7d28-43e9-b1a5-e063d0be09e5 ro"
+    },
+    "cpu": {
+      "exit": 0,
+      "output": "{\n   \"lscpu\": [\n      {\n         \"field\": \"Architecture:\",\n         \"data\": \"x86_64\"\n      },{\n         \"field\": \"CPU op-mode(s):\",\n         \"data\": \"32-bit, 64-bit\"\n      },{\n         \"field\": \"Address sizes:\",\n         \"data\": \"39 bits physical, 48 bits virtual\"\n      },{\n         \"field\": \"Byte Order:\",\n         \"data\": \"Little Endian\"\n      },{\n         \"field\": \"CPU(s):\",\n         \"data\": \"16\"\n      },{\n         \"field\": \"On-line CPU(s) list:\",\n         \"data\": \"0-15\"\n      },{\n         \"field\": \"Vendor ID:\",\n         \"data\": \"GenuineIntel\"\n      },{\n         \"field\": \"BIOS Vendor ID:\",\n         \"data\": \"Intel(R) Corporation\"\n      },{\n         \"field\": \"Model name:\",\n         \"data\": \"13th Gen Intel(R) Core(TM) i7-13620H\"\n      },{\n         \"field\": \"BIOS Model name:\",\n         \"data\": \"13th Gen Intel(R) Core(TM) i7-13620H To Be Filled By O.E.M. CPU @ 4.6GHz\"\n      },{\n         \"field\": \"BIOS CPU family:\",\n         \"data\": \"198\"\n      },{\n         \"field\": \"CPU family:\",\n         \"data\": \"6\"\n      },{\n         \"field\": \"Model:\",\n         \"data\": \"186\"\n      },{\n         \"field\": \"Thread(s) per core:\",\n         \"data\": \"2\"\n      },{\n         \"field\": \"Core(s) per socket:\",\n         \"data\": \"10\"\n      },{\n         \"field\": \"Socket(s):\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"Stepping:\",\n         \"data\": \"2\"\n      },{\n         \"field\": \"CPU(s) scaling MHz:\",\n         \"data\": \"36%\"\n      },{\n         \"field\": \"CPU max MHz:\",\n         \"data\": \"4900.0000\"\n      },{\n         \"field\": \"CPU min MHz:\",\n         \"data\": \"400.0000\"\n      },{\n         \"field\": \"BogoMIPS:\",\n         \"data\": \"5836.80\"\n      },{\n         \"field\": \"Flags:\",\n         \"data\": \"fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities ibpb_exit_to_user\"\n      },{\n         \"field\": \"Virtualization:\",\n         \"data\": \"VT-x\"\n      },{\n         \"field\": \"L1d cache:\",\n         \"data\": \"416 KiB (10 instances)\"\n      },{\n         \"field\": \"L1i cache:\",\n         \"data\": \"448 KiB (10 instances)\"\n      },{\n         \"field\": \"L2 cache:\",\n         \"data\": \"9.5 MiB (7 instances)\"\n      },{\n         \"field\": \"L3 cache:\",\n         \"data\": \"24 MiB (1 instance)\"\n      },{\n         \"field\": \"NUMA node(s):\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"NUMA node0 CPU(s):\",\n         \"data\": \"0-15\"\n      },{\n         \"field\": \"Vulnerability Gather data sampling:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Indirect target selection:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Itlb multihit:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability L1tf:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Mds:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Meltdown:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Mmio stale data:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Reg file data sampling:\",\n         \"data\": \"Mitigation; Clear Register File\"\n      },{\n         \"field\": \"Vulnerability Retbleed:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Spec rstack overflow:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Spec store bypass:\",\n         \"data\": \"Mitigation; Speculative Store Bypass disabled via prctl\"\n      },{\n         \"field\": \"Vulnerability Spectre v1:\",\n         \"data\": \"Mitigation; usercopy/swapgs barriers and __user pointer sanitization\"\n      },{\n         \"field\": \"Vulnerability Spectre v2:\",\n         \"data\": \"Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI BHI_DIS_S\"\n      },{\n         \"field\": \"Vulnerability Srbds:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Tsa:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Tsx async abort:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Vmscape:\",\n         \"data\": \"Mitigation; IBPB before exit to userspace\"\n      }\n   ]\n}"
+    },
+    "cpu_topology": {
+      "exit": 0,
+      "output": "CPU CORE SOCKET ONLINE\n  0    0      0    yes\n  1    0      0    yes\n  2    1      0    yes\n  3    1      0    yes\n  4    2      0    yes\n  5    2      0    yes\n  6    3      0    yes\n  7    3      0    yes\n  8    4      0    yes\n  9    4      0    yes\n 10    5      0    yes\n 11    5      0    yes\n 12    6      0    yes\n 13    7      0    yes\n 14    8      0    yes\n 15    9      0    yes"
+    },
+    "memory": {
+      "exit": 0,
+      "output": "total        used        free      shared  buff/cache   available\nMem:     24915775488   777023488 23641960448    12652544   762720256 24138752000\nSwap:     8589930496           0  8589930496"
+    },
+    "memory_modules": {
+      "exit": 0,
+      "output": "# dmidecode 3.5\nGetting SMBIOS data from sysfs.\nSMBIOS 3.5.0 present.\n\nHandle 0x0028, DMI type 17, 92 bytes\nMemory Device\n\tArray Handle: 0x0027\n\tError Information Handle: Not Provided\n\tTotal Width: 64 bits\n\tData Width: 64 bits\n\tSize: 16 GB\n\tForm Factor: SODIMM\n\tSet: None\n\tLocator: Controller0-ChannelA-DIMM0\n\tBank Locator: BANK 0\n\tType: DDR4\n\tType Detail: Synchronous\n\tSpeed: 3200 MT/s\n\tManufacturer: 0x0C38\n\tSerial Number: 23451732\n\tAsset Tag: 9876543210\n\tPart Number:   QXD016GD4S320000  \n\tRank: 2\n\tConfigured Memory Speed: 3200 MT/s\n\tMinimum Voltage: 1.2 V\n\tMaximum Voltage: 1.2 V\n\tConfigured Voltage: 1.2 V\n\tMemory Technology: DRAM\n\tMemory Operating Mode Capability: Volatile memory\n\tFirmware Version: Not Specified\n\tModule Manufacturer ID: Bank 13, Hex 0x38\n\tModule Product ID: Unknown\n\tMemory Subsystem Controller Manufacturer ID: Unknown\n\tMemory Subsystem Controller Product ID: Unknown\n\tNon-Volatile Size: None\n\tVolatile Size: 16 GB\n\tCache Size: None\n\tLogical Size: None\n\nHandle 0x0029, DMI type 17, 92 bytes\nMemory Device\n\tArray Handle: 0x0027\n\tError Information Handle: Not Provided\n\tTotal Width: 64 bits\n\tData Width: 64 bits\n\tSize: 8 GB\n\tForm Factor: SODIMM\n\tSet: None\n\tLocator: Controller1-ChannelA-DIMM0\n\tBank Locator: BANK 0\n\tType: DDR4\n\tType Detail: Synchronous\n\tSpeed: 3200 MT/s\n\tManufacturer: Crucial Technology\n\tSerial Number: E3B16F53\n\tAsset Tag: 9876543210\n\tPart Number: CT8G4SFS632A.M4FE   \n\tRank: 1\n\tConfigured Memory Speed: 3200 MT/s\n\tMinimum Voltage: 1.2 V\n\tMaximum Voltage: 1.2 V\n\tConfigured Voltage: 1.2 V\n\tMemory Technology: DRAM\n\tMemory Operating Mode Capability: Volatile memory\n\tFirmware Version: Not Specified\n\tModule Manufacturer ID: Bank 6, Hex 0x9B\n\tModule Product ID: Unknown\n\tMemory Subsystem Controller Manufacturer ID: Unknown\n\tMemory Subsystem Controller Product ID: Unknown\n\tNon-Volatile Size: None\n\tVolatile Size: 8 GB\n\tCache Size: None\n\tLogical Size: None"
+    },
+    "pci": {
+      "exit": 0,
+      "output": "00:00.0 Host bridge [0600]: Intel Corporation Device [8086:a715]\n\tDeviceName: Onboard - Other\n\tSubsystem: Intel Corporation Device [8086:7270]\n00:02.0 VGA compatible controller [0300]: Intel Corporation Raptor Lake-P [UHD Graphics] [8086:a7a8] (rev 04)\n\tDeviceName: Onboard - Video\n\tSubsystem: Intel Corporation Raptor Lake-P [UHD Graphics] [8086:2212]\n\tKernel driver in use: i915\n\tKernel modules: i915, xe\n00:06.0 PCI bridge [0604]: Intel Corporation Raptor Lake PCIe 4.0 Graphics Port [8086:a74d]\n\tSubsystem: Intel Corporation Raptor Lake PCIe 4.0 Graphics Port [8086:7270]\n\tKernel driver in use: pcieport\n00:06.2 PCI bridge [0604]: Intel Corporation Device [8086:a73d]\n\tSubsystem: Intel Corporation Device [8086:7270]\n\tKernel driver in use: pcieport\n00:14.0 USB controller [0c03]: Intel Corporation Alder Lake PCH USB 3.2 xHCI Host Controller [8086:51ed] (rev 01)\n\tDeviceName: Onboard - Other\n\tSubsystem: Intel Corporation Alder Lake PCH USB 3.2 xHCI Host Controller [8086:7270]\n\tKernel driver in use: xhci_hcd\n\tKernel modules: xhci_pci\n00:14.2 RAM memory [0500]: Intel Corporation Alder Lake PCH Shared SRAM [8086:51ef] (rev 01)\n\tDeviceName: Onboard - Other\n\tSubsystem: Intel Corporation Alder Lake PCH Shared SRAM [8086:7270]\n00:16.0 Communication controller [0780]: Intel Corporation Alder Lake PCH HECI Controller [8086:51e0] (rev 01)\n\tDeviceName: Onboard - Other\n\tSubsystem: Intel Corporation Alder Lake PCH HECI Controller [8086:7270]\n\tKernel driver in use: mei_me\n\tKernel modules: mei_me\n00:1c.0 PCI bridge [0604]: Intel Corporation Device [8086:51bc] (rev 01)\n\tSubsystem: Intel Corporation Device [8086:7270]\n\tKernel driver in use: pcieport\n00:1c.5 PCI bridge [0604]: Intel Corporation Device [8086:51bd] (rev 01)\n\tSubsystem: Intel Corporation Device [8086:7270]\n\tKernel driver in use: pcieport\n00:1f.0 ISA bridge [0601]: Intel Corporation Raptor Lake LPC/eSPI Controller [8086:519d] (rev 01)\n\tDeviceName: Onboard - Other\n\tSubsystem: Intel Corporation Raptor Lake LPC/eSPI Controller [8086:7270]\n00:1f.3 Audio device [0403]: Intel Corporation Raptor Lake-P/U/H cAVS [8086:51ca] (rev 01)\n\tDeviceName: Onboard - Sound\n\tSubsystem: Intel Corporation Raptor Lake-P/U/H cAVS [8086:7270]\n\tKernel driver in use: snd_hda_intel\n\tKernel modules: snd_hda_intel, snd_sof_pci_intel_tgl\n00:1f.4 SMBus [0c05]: Intel Corporation Alder Lake PCH-P SMBus Host Controller [8086:51a3] (rev 01)\n\tDeviceName: Onboard - Other\n\tSubsystem: Intel Corporation Alder Lake PCH-P SMBus Host Controller [8086:7270]\n\tKernel driver in use: i801_smbus\n\tKernel modules: i2c_i801\n00:1f.5 Serial bus controller [0c80]: Intel Corporation Alder Lake-P PCH SPI Controller [8086:51a4] (rev 01)\n\tDeviceName: Onboard - Other\n\tSubsystem: Intel Corporation Alder Lake-P PCH SPI Controller [8086:7270]\n\tKernel driver in use: intel-spi\n\tKernel modules: spi_intel_pci\n02:00.0 Non-Volatile memory controller [0108]: Kingston Technology Company, Inc. NV2 NVMe SSD E21T (DRAM-less) [2646:5019]\n\tSubsystem: Kingston Technology Company, Inc. NV2 NVMe SSD E21T [2646:5019]\n\tKernel driver in use: nvme\n\tKernel modules: nvme\n03:00.0 Ethernet controller [0200]: Realtek Semiconductor Co., Ltd. RTL8111/8168/8211/8411 PCI Express Gigabit Ethernet Controller [10ec:8168] (rev 15)\n\tSubsystem: Realtek Semiconductor Co., Ltd. RTL8111/8168/8411 PCI Express Gigabit Ethernet Controller [10ec:0123]\n\tKernel driver in use: r8169\n\tKernel modules: r8169\n04:00.0 Network controller [0280]: Realtek Semiconductor Co., Ltd. RTL8852BE PCIe 802.11ax Wireless Network Controller [10ec:b852]\n\tSubsystem: AzureWave RTL8852BE PCIe 802.11ax Wireless Network Controller [1a3b:5470]\n\tKernel driver in use: rtw89_8852be\n\tKernel modules: rtw89_8852be"
+    },
+    "nic": {
+      "exit": 0,
+      "output": "driver: r8169\nversion: 6.8.1-1060-realtime\nfirmware-version: rtl8168h-2_0.0.2 02/26/15\nexpansion-rom-version: \nbus-info: 0000:03:00.0\nsupports-statistics: yes\nsupports-test: no\nsupports-eeprom-access: no\nsupports-register-dump: yes\nsupports-priv-flags: no"
+    },
+    "nic_link": {
+      "exit": 0,
+      "output": "Settings for enp3s0:\n\tSupported ports: [ TP\t MII ]\n\tSupported link modes:   10baseT/Half 10baseT/Full\n\t                        100baseT/Half 100baseT/Full\n\t                        1000baseT/Full\n\tSupported pause frame use: Symmetric Receive-only\n\tSupports auto-negotiation: Yes\n\tSupported FEC modes: Not reported\n\tAdvertised link modes:  10baseT/Half 10baseT/Full\n\t                        100baseT/Half 100baseT/Full\n\t                        1000baseT/Full\n\tAdvertised pause frame use: Symmetric Receive-only\n\tAdvertised auto-negotiation: Yes\n\tAdvertised FEC modes: Not reported\n\tLink partner advertised link modes:  10baseT/Half 10baseT/Full\n\t                                     100baseT/Half 100baseT/Full\n\tLink partner advertised pause frame use: No\n\tLink partner advertised auto-negotiation: Yes\n\tLink partner advertised FEC modes: Not reported\n\tSpeed: 100Mb/s\n\tDuplex: Full\n\tAuto-negotiation: on\n\tmaster-slave cfg: preferred slave\n\tmaster-slave status: slave\n\tPort: Twisted Pair\n\tPHYAD: 0\n\tTransceiver: external\n\tMDI-X: Unknown\n\tSupports Wake-on: pumbg\n\tWake-on: d\n\tLink detected: yes"
+    },
+    "nic_coalesce": {
+      "exit": 0,
+      "output": "Coalesce parameters for enp3s0:\nAdaptive RX: n/a  TX: n/a\nstats-block-usecs:\tn/a\nsample-interval:\tn/a\npkt-rate-low:\t\tn/a\npkt-rate-high:\t\tn/a\n\nrx-usecs:\t0\nrx-frames:\t1\nrx-usecs-irq:\tn/a\nrx-frames-irq:\tn/a\n\ntx-usecs:\t0\ntx-frames:\t1\ntx-usecs-irq:\tn/a\ntx-frames-irq:\tn/a\n\nrx-usecs-low:\tn/a\nrx-frame-low:\tn/a\ntx-usecs-low:\tn/a\ntx-frame-low:\tn/a\n\nrx-usecs-high:\tn/a\nrx-frame-high:\tn/a\ntx-usecs-high:\tn/a\ntx-frame-high:\tn/a\n\nCQE mode RX: n/a  TX: n/a\n\ntx-aggr-max-bytes:\tn/a\ntx-aggr-max-frames:\tn/a\ntx-aggr-time-usecs\tn/a"
+    },
+    "disks": {
+      "exit": 0,
+      "output": "NAME    MODEL                SIZE ROTA\nloop0                       13.1M    0\nloop1                         74M    0\nloop2                       50.3M    0\nloop3                       44.7M    0\nloop4                       13.2M    0\nnvme0n1 KINGSTON SNV2S250G 232.9G    0"
+    },
+    "clocksource": {
+      "exit": 0,
+      "output": "tsc"
+    },
+    "rt_runtime": {
+      "exit": 0,
+      "output": "kernel.sched_rt_period_us = 1000000\nkernel.sched_rt_runtime_us = 950000"
+    },
+    "aspm": {
+      "exit": 0,
+      "output": "[default] performance powersave powersupersave"
+    },
+    "cpuidle": {
+      "exit": 0,
+      "output": "none"
+    },
+    "kernel_config": {
+      "exit": 0,
+      "output": "CONFIG_NO_HZ_FULL=y\nCONFIG_PREEMPT_RT=y\nCONFIG_RCU_NOCB_CPU=y\nCONFIG_HZ_1000=y"
+    },
+    "project_commit": {
+      "exit": 0,
+      "output": "d152c1cfaf8cef74189a24b639f4e5ba587c5b0e"
+    },
+    "project_status": {
+      "exit": 0,
+      "output": "M README.md\n M src/ecat2can_master.c\n?? CPU_CORE_RETEST_2026-10-15.md\n?? CPU_KERNEL_BIOS_RT_REPORT_2026-10-15.md\n?? ECAT_CAN_RT_REPORT_2026-10-15.md\n?? HOST_RT_REPORT_2026-10-15.md\n?? NEW_CAN_RT_REPORT_2026-10-16.md\n?? scripts/__pycache__/\n?? scripts/rt-control-run.sh\n?? scripts/rt-core-experiment.py\n?? scripts/rt-host-test.sh\n?? src/rt_probe.h"
+    },
+    "project_diff": {
+      "exit": 0,
+      "output": "README.md             | 50 ++++++++++++++++++++++++++++++++++++++++++++++++++\n src/ecat2can_master.c | 29 +++++++++++++++++++++++++++--\n 2 files changed, 77 insertions(+), 2 deletions(-)"
+    }
+  },
+  "restored_current": {
+    "online": "0-15",
+    "no_turbo": "0",
+    "napi_threaded": "0",
+    "workqueue_mask": "ffff",
+    "power": {
+      "policy11": {
+        "scaling_driver": "intel_pstate",
+        "scaling_governor": "powersave",
+        "energy_performance_preference": "balance_performance",
+        "cpuinfo_max_freq": "4700000",
+        "cpuinfo_min_freq": "400000"
+      },
+      "policy8": {
+        "scaling_driver": "intel_pstate",
+        "scaling_governor": "powersave",
+        "energy_performance_preference": "balance_performance",
+        "cpuinfo_max_freq": "4700000",
+        "cpuinfo_min_freq": "400000"
+      },
+      "policy6": {
+        "scaling_driver": "intel_pstate",
+        "scaling_governor": "powersave",
+        "energy_performance_preference": "balance_performance",
+        "cpuinfo_max_freq": "4900000",
+        "cpuinfo_min_freq": "400000"
+      },
+      "policy4": {
+        "scaling_driver": "intel_pstate",
+        "scaling_governor": "powersave",
+        "energy_performance_preference": "balance_performance",
+        "cpuinfo_max_freq": "4900000",
+        "cpuinfo_min_freq": "400000"
+      },
+      "policy2": {
+        "scaling_driver": "intel_pstate",
+        "scaling_governor": "powersave",
+        "energy_performance_preference": "balance_performance",
+        "cpuinfo_max_freq": "4700000",
+        "cpuinfo_min_freq": "400000"
+      },
+      "policy14": {
+        "scaling_driver": "intel_pstate",
+        "scaling_governor": "powersave",
+        "energy_performance_preference": "balance_performance",
+        "cpuinfo_max_freq": "3600000",
+        "cpuinfo_min_freq": "400000"
+      },
+      "policy0": {
+        "scaling_driver": "intel_pstate",
+        "scaling_governor": "powersave",
+        "energy_performance_preference": "balance_performance",
+        "cpuinfo_max_freq": "4700000",
+        "cpuinfo_min_freq": "400000"
+      },
+      "policy12": {
+        "scaling_driver": "intel_pstate",
+        "scaling_governor": "powersave",
+        "energy_performance_preference": "balance_performance",
+        "cpuinfo_max_freq": "3600000",
+        "cpuinfo_min_freq": "400000"
+      },
+      "policy9": {
+        "scaling_driver": "intel_pstate",
+        "scaling_governor": "powersave",
+        "energy_performance_preference": "balance_performance",
+        "cpuinfo_max_freq": "4700000",
+        "cpuinfo_min_freq": "400000"
+      },
+      "policy10": {
+        "scaling_driver": "intel_pstate",
+        "scaling_governor": "powersave",
+        "energy_performance_preference": "balance_performance",
+        "cpuinfo_max_freq": "4700000",
+        "cpuinfo_min_freq": "400000"
+      },
+      "policy7": {
+        "scaling_driver": "intel_pstate",
+        "scaling_governor": "powersave",
+        "energy_performance_preference": "balance_performance",
+        "cpuinfo_max_freq": "4900000",
+        "cpuinfo_min_freq": "400000"
+      },
+      "policy5": {
+        "scaling_driver": "intel_pstate",
+        "scaling_governor": "powersave",
+        "energy_performance_preference": "balance_performance",
+        "cpuinfo_max_freq": "4900000",
+        "cpuinfo_min_freq": "400000"
+      },
+      "policy3": {
+        "scaling_driver": "intel_pstate",
+        "scaling_governor": "powersave",
+        "energy_performance_preference": "balance_performance",
+        "cpuinfo_max_freq": "4700000",
+        "cpuinfo_min_freq": "400000"
+      },
+      "policy15": {
+        "scaling_driver": "intel_pstate",
+        "scaling_governor": "powersave",
+        "energy_performance_preference": "balance_performance",
+        "cpuinfo_max_freq": "3600000",
+        "cpuinfo_min_freq": "400000"
+      },
+      "policy1": {
+        "scaling_driver": "intel_pstate",
+        "scaling_governor": "powersave",
+        "energy_performance_preference": "balance_performance",
+        "cpuinfo_max_freq": "4700000",
+        "cpuinfo_min_freq": "400000"
+      },
+      "policy13": {
+        "scaling_driver": "intel_pstate",
+        "scaling_governor": "powersave",
+        "energy_performance_preference": "balance_performance",
+        "cpuinfo_max_freq": "3600000",
+        "cpuinfo_min_freq": "400000"
+      }
+    }
+  },
+  "sha256": {
+    "build/ecat2can_master": "75803d10d4a0551285c9d699ca1afec4c528e27b892252cbbc3d25632d62532e",
+    "src/rt_probe.h": "7ce692aa4e133e7d1e6d04a10370365fcb1b7796cc57cfd835e1afd9ff4c674d",
+    "src/ecat2can_master.c": "465e5eb8a48acbcf93c1f8e40b5755a35dafd0213dd39af65c47dec53fe30368",
+    "scripts/rt-control-run.sh": "6b7fa106fbfe03f53f0be8d4e21bc072b88c8bdb8f0eac167327d5e7ca50d259",
+    "build/rt-tests/20261015-e2e/load-low.py": "e1669d45a6b7ea93785033eb8819dd16dbd369dba6c51012e8816f4b1656a99b",
+    "NEW_CAN_RT_REPORT_2026-10-16.md": "190fae601a8ccebfe3f2d5aaa7f54f77a0e4d7c3e697a273215a40aeefca2a09",
+    "build/rt-tests/new-can-evidence-20261016.tar.gz": "f58196837363d370fdff754951d86180551beb1b459fb0d382ca90dca9a5cf20"
+  }
+}

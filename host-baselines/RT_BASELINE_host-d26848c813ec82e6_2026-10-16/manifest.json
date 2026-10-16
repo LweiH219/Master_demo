@@ -1,0 +1,82 @@
+{
+  "schema": 1,
+  "baseline_id": "host-d26848c813ec82e6_2026-10-16_new-can",
+  "host_id": "host-d26848c813ec82e6",
+  "identity_sha256": "d26848c813ec82e6c5845e7a1ba8c90929a5f44b5262d1d888efa7f3010a6168",
+  "model": {
+    "sys_vendor": "Thunderobot",
+    "product_name": "MIX NUC II",
+    "product_version": "V1.0",
+    "board_vendor": "Thunderobot",
+    "board_name": "Thunderobot MIX NUC II",
+    "board_version": "V1.0",
+    "bios_vendor": "American Megatrends International, LLC.",
+    "bios_version": "5.27",
+    "bios_date": "08/21/2025"
+  },
+  "report": "report.md",
+  "inventory": "host-inventory.json",
+  "results": "results.json",
+  "evidence": "evidence.tar.gz",
+  "test_profile": {
+    "kernel": "6.8.1-1060-realtime",
+    "application": {
+      "cpu": 4,
+      "scheduler": "SCHED_FIFO",
+      "priority": 40
+    },
+    "napi": {
+      "cpu": 6,
+      "scheduler": "SCHED_FIFO",
+      "priority": 90,
+      "threaded": true
+    },
+    "ethercat_irq": {
+      "number_at_test": 134,
+      "effective_cpu": 6
+    },
+    "cpu_governor": "performance",
+    "no_turbo": 1,
+    "smt": "enabled; no CPUs offlined",
+    "frequency_hz": 1000,
+    "deadline_us": 1000,
+    "topology": "one slave CAN0 to CAN2 physical loop, no motors",
+    "can_bitrate_bps": 1000000,
+    "probe_id": "0x600",
+    "probe_bytes": 8,
+    "background_frames_per_cycle": 4,
+    "host_load": "4 nice10 intermittent computation workers, approximately 50% duty",
+    "durations_seconds": {
+      "idle": 120,
+      "can_load": 60,
+      "host_and_can": 60,
+      "ethercat_only": 30
+    },
+    "persistent": false
+  },
+  "measurement_limitations": [
+    "Matched-response quantiles exclude unmatched samples; always compare deadline misses",
+    "Round-trip, not measured one-way delay",
+    "No policy inference, motor driver or mechanical response",
+    "Module model/serial not independently captured; topology confirmed by user",
+    "Short qualification, not worst-case hard realtime proof"
+  ],
+  "artifact_sha256": {
+    "capture-host.py": "c079ded96cfd1048c01f7e94e6d8bcab232ff04da68980aee651e01b3a450ee1",
+    "evidence.tar.gz": "f58196837363d370fdff754951d86180551beb1b459fb0d382ca90dca9a5cf20",
+    "host-inventory.json": "e4dc8ef0c3062dea0f1037d41d6da340eb596a18ef7ee4e55962969f1df9e16b",
+    "README.md": "7f154c411c9084c54cd27b0d49648a7c4bafc2958ca329c7dab094a77bc3c932",
+    "report.md": "9081cd5add2e833cf7ee6dae5970861c5a9b7e3042e1174e344a6d95827f2376",
+    "restored-state.json": "4491b09d927501295477475174bc80e5d550810d86c1c6205fcd6b06990d369d",
+    "results.json": "d696e9974ca1320926cebee543dc0f73d7c2cd0048c748ae212f89a68ed4f06b"
+  },
+  "test_input_sha256": {
+    "build/ecat2can_master": "75803d10d4a0551285c9d699ca1afec4c528e27b892252cbbc3d25632d62532e",
+    "src/rt_probe.h": "7ce692aa4e133e7d1e6d04a10370365fcb1b7796cc57cfd835e1afd9ff4c674d",
+    "src/ecat2can_master.c": "465e5eb8a48acbcf93c1f8e40b5755a35dafd0213dd39af65c47dec53fe30368",
+    "scripts/rt-control-run.sh": "6b7fa106fbfe03f53f0be8d4e21bc072b88c8bdb8f0eac167327d5e7ca50d259",
+    "build/rt-tests/20261015-e2e/load-low.py": "e1669d45a6b7ea93785033eb8819dd16dbd369dba6c51012e8816f4b1656a99b",
+    "NEW_CAN_RT_REPORT_2026-10-16.md": "190fae601a8ccebfe3f2d5aaa7f54f77a0e4d7c3e697a273215a40aeefca2a09",
+    "build/rt-tests/new-can-evidence-20261016.tar.gz": "f58196837363d370fdff754951d86180551beb1b459fb0d382ca90dca9a5cf20"
+  }
+}

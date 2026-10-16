@@ -2454,12 +2454,15 @@ static int cmd_reset(fieldbus_t *fb)
     return 0;
 }
 
+#include "rt_probe.h"
+
 /* ===================== main ===================== */
 static void usage(const char *prog)
 {
     printf("用法: %s <网卡名> <命令> [参数...]\n"
            "\n"
            "  regs                    ★读 ESC 寄存器（DL_STAT / STATION_ADDR）判断链路与身份\n"
+           "  probe <sec> <tx|ecat> <rx> [Hz] [load]  CSV absolute deadline/RTT probe (ID 0x600)\n"
            "  info                    进 OP，打印从站信息并周期刷新（Ctrl+C 退出）\n"
            "  loop [次数]             LOOP_TEST，192 字节往返一致性校验（默认 1000）\n"
            "  scan [次数]             ★多通道扫描：只看不发，统计各路收帧数与出现过的 ID\n"
@@ -2546,7 +2549,27 @@ int main(int argc, char *argv[])
         return 0;
     }
 
-    if (strcmp(cmd, "work") == 0) {
+    if (strcmp(cmd, "probe") == 0) {
+        if (argc < 6 || argc > 8 || getenv("ECAT2CAN_PROBE_CSV") == NULL) {
+            fprintf(stderr,"probe <seconds 1..600> <tx 0..3|ecat> <rx 0..3> [Hz 100..2000] [load 0..16]; set ECAT2CAN_PROBE_CSV\n");
+            return 1;
+        }
+        int values[5] = {0, 0, 0, 1000, 0};
+        for (int j=3; j<argc; ++j) {
+            if (j==4 && strcmp(argv[j],"ecat")==0) { values[j-3]=255; continue; }
+            char *end;
+            errno=0;
+            long value=strtol(argv[j],&end,10);
+            if (errno || end==argv[j] || *end || value<0 || value>1200000) return 1;
+            values[j-3]=(int)value;
+        }
+        cycles=values[0]; int tx=values[1],rx=values[2];
+        lp_freq=values[3];lp_load=values[4];
+        if (cycles < 1 || cycles > 600 || (tx != 255 && (tx < 0 || tx > 3)) ||
+            rx < 0 || rx > 3 || lp_freq < 100 || lp_freq > 2000 || lp_load < 0 ||
+            lp_load > 16 || (tx == 255 && lp_load != 0)) return 1;
+        tx_ch = (uint8_t)tx; rx_ch = (uint8_t)rx;
+    } else if (strcmp(cmd, "work") == 0) {
         int i;
         /* 通道是必填的第一个参数：work <ch> <id> [b0..b7] */
         if (argc < 4) {
@@ -2768,7 +2791,9 @@ int main(int argc, char *argv[])
         return 2;
     }
 
-    if (strcmp(cmd, "loop") == 0) {
+    if (strcmp(cmd, "probe") == 0) {
+        rc = cmd_probe(&fb, cycles, tx_ch, rx_ch, lp_freq, lp_load);
+    } else if (strcmp(cmd, "loop") == 0) {
         rc = cmd_loop(&fb, cycles);
     } else if (strcmp(cmd, "scan") == 0) {
         rc = cmd_scan(&fb, cycles);

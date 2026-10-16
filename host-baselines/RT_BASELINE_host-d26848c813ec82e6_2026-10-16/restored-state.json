@@ -1,0 +1,15 @@
+{
+  "online": "0-15",
+  "workqueue": "ffff",
+  "no_turbo": "0",
+  "threaded": "0",
+  "carrier": "1",
+  "temperature_max_C": 53.0,
+  "restore_errors": [],
+  "profiles": [
+    "/home/tide/Master_demo/build/rt-control-20261016-110926-jrCVPy",
+    "/home/tide/Master_demo/build/rt-control-20261016-110820-sV0187",
+    "/home/tide/Master_demo/build/rt-control-20261016-110618-Qjzats",
+    "/home/tide/Master_demo/build/rt-control-20261016-111028-gQAIT5"
+  ]
+}

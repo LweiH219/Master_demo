@@ -1013,3 +1013,53 @@ FetchContent_MakeAvailable(SOEM)
 ```
 
 这样仓库里不含 SOEM 源码，但**首次构建需要联网**。
+
+---
+
+## 13. 主机实时性复测（2026-10-15）
+
+新增纯主机复测入口，不访问 EtherCAT/CAN。需要系统已有 `cyclictest`、`chrt`、`python3`：
+
+```bash
+sudo ./scripts/rt-host-test.sh 30 current
+sudo ./scripts/rt-host-test.sh 30 performance-no-turbo
+```
+
+每次先运行项目自带 `rt ... host`，再用 `cyclictest` 测绝对唤醒延迟，
+均使用 FIFO 80；第二项测试锁定内存。日志写入脚本打印的 `build/rt-host-*`。
+`performance` 模式会临时调整 governor，正常退出或收到 INT/TERM 后恢复原 governor 和 EPP；
+不会持久修改启动参数。不要同时手动调整 governor，SIGKILL/断电无法触发退出清理。
+
+项目 `rt` 中的“截止期错失”实际定义为**相邻周期 >1100 µs**，
+不是对严格 1000 µs 绝对截止期的完整判定。短时零错失不能证明硬实时保证。
+本次完整结果和温度限制见 `HOST_RT_REPORT_2026-10-15.md`。
+
+本机实测全核 performance 与睿频同时使用时，在受控负载下容易触及试验温度停止线；
+新增 `performance-no-turbo` 模式，临时关闭 Intel 睿频并在退出时恢复。
+该模式在本次间歇负载中最高 57°C，唤醒 p99.9 为 8 µs；吞吐变化需用真实控制任务复核。
+
+## 14. EtherCAT/CAN 端到端验证（2026-10-15）
+
+当前主机 i7-13620H / PREEMPT_RT / r8169 的推荐组合为：
+performance + 禁睿频、应用 FIFO40/CPU4、enp3s0 threaded NAPI FIFO90/CPU6。
+这是当前单从站 CAN0↔CAN2 回环实测选择，不能直接复制为其他主机的最优配置。
+
+```bash
+sudo env ECAT2CAN_PROBE_CSV="$PWD/build/e2e-repeat.csv" \
+  ./scripts/rt-control-run.sh \
+  ./build/ecat2can_master enp3s0 probe 60 0 2 1000 4
+```
+
+必须确认回环接线且总线无电机；probe 使用 0x600 与 0x601..0x610，
+记录每拍的绝对截止期、完整 WKC、序号/token、RTT 和迟到回声，不使用 RTT/2 代替单程实测。
+参数为秒数、发送通道（ecat 表示只测 EtherCAT）、接收通道、频率、背景帧数。
+当前验证仅 1000 Hz；从站现有 DC 配置为 1ms。
+返回码 0 表示本次完整采集且零截止期失约/零 WKC 异常，3 表示采集完整但存在异常，2 表示运行失败或中断。
+
+脚本按命令作用域启用配置并恢复，包含85°C温度停止线；正常退出、失败和TERM恢复均已验证。
+它不会为任意被调用程序自动锁定内存；probe 自身执行 mlockall 和预触碰，
+实际控制程序需要单独实现。测量段分位数仅代表匹配样本，要同时看未匹配/失约数量。
+
+完整结果、限制与官方参考资料见 `ECAT_CAN_RT_REPORT_2026-10-15.md`。
+最终120秒空载有5次无回声，60秒背景负载零失约，60秒主机+CAN负载1次无回声；
+推荐配置尚未达到绝对零失约保证。残余问题优先排查从站 PDO/CAN 队列和同步。
