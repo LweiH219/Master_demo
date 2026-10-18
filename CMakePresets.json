@@ -13,7 +13,8 @@
       "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-        "BUILD_DJI_MOTOR_TEST": "ON"
+        "BUILD_DJI_MOTOR_TEST": "ON",
+        "BUILD_GUI": "ON"
       }
     }
   ],

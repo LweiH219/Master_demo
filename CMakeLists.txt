@@ -1,7 +1,8 @@
 cmake_minimum_required(VERSION 3.28)
-project(ecat2can_host LANGUAGES C)
+project(ecat2can_host LANGUAGES C CXX)
 
 option(BUILD_DJI_MOTOR_TEST "Build the optional DJI motor application example" ON)
+option(BUILD_GUI "Build the Qt graphical test workbench when Qt is available" ON)
 
 # -----------------------------------------------------------------------------
 #  ECAT2CAN 主机侧工具包（完全自包含）
@@ -12,6 +13,8 @@ option(BUILD_DJI_MOTOR_TEST "Build the optional DJI motor application example" O
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -48,14 +51,29 @@ if(BUILD_DJI_MOTOR_TEST)
   target_compile_options(motor_pos PRIVATE -Wall -Wextra)
 endif()
 
+if(BUILD_GUI)
+  find_package(Qt5 5.12 COMPONENTS Widgets Network QUIET)
+  if(Qt5_FOUND)
+    add_executable(ecat2can_gui src/ecat2can_gui.cpp)
+    target_link_libraries(ecat2can_gui PRIVATE Qt5::Widgets Qt5::Network)
+    target_compile_options(ecat2can_gui PRIVATE -Wall -Wextra)
+  else()
+    message(WARNING "未找到 Qt 5 Widgets/Network，跳过图形界面；安装 qtbase5-dev 后重新配置即可启用。")
+  endif()
+endif()
+
 # ---- 安装 ---------------------------------------------------------------
 include(GNUInstallDirs)
 install(TARGETS ecat2can_master RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(BUILD_DJI_MOTOR_TEST)
   install(TARGETS motor_pos RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
+if(TARGET ecat2can_gui)
+  install(TARGETS ecat2can_gui RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
 install(PROGRAMS scripts/can-linktest.sh DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES README.md DESTINATION ${CMAKE_INSTALL_DOCDIR})
+install(DIRECTORY docs/ DESTINATION ${CMAKE_INSTALL_DOCDIR}/docs)
 
 message(STATUS "")
 message(STATUS "  ECAT2CAN 主机侧工具包")

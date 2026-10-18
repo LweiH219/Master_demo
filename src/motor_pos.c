@@ -280,6 +280,7 @@ typedef struct {
     int   log_ms;           /* 非交互输出的状态打印周期，单位毫秒。 */
     int   invert_spd;       /* 按需要反转反馈转速符号。 */
     int   monitor;          /* 只读模式，强制禁止输出。 */
+    int   csv;              /* 输出 GUI 可读取的结构化遥测采样。 */
     int   gm_current_mode;  /* GM6020：1 为电流模式(0x1FE/0x2FE)，0 为电压模式。 */
     float filter_ms;        /* 反馈低通时间常数，不是采样周期；0 表示关闭。 */
     int   cur_loop;         /* 可选的主机侧电流环，默认关闭。 */
@@ -315,6 +316,7 @@ static void usage(const char *p)
 "  --max-rpm F            位置环输出限幅，转子 rpm（默认 2000）\n"
 "  --invert-spd           把反馈转速符号取反（默认不取；闭环发散时再试）\n"
 "  --monitor              只读监视模式：硬禁止使能，输出恒为 0\n"
+"  --csv                  额外输出 MOTOR_CSV 遥测行（供图形界面绘图）\n"
 "  --log-ms N             非交互模式下的状态打印间隔 ms（默认 200）\n"
 "\n"
 "反馈滤波（重要）:\n"
@@ -502,6 +504,7 @@ int main(int argc, char *argv[])
         .log_ms = 200,
         .invert_spd = 0,
         .monitor = 0,
+        .csv = 0,
         .gm_current_mode = 1,   /* 默认电流模式，与 M3508 统一 */
         .filter_ms = 5.0f,
         .cur_loop = 0,
@@ -557,6 +560,7 @@ int main(int argc, char *argv[])
         else if (!strcmp(a, "--log-ms")      && i + 1 < argc) o.log_ms      = atoi(argv[++i]);
         else if (!strcmp(a, "--invert-spd"))                  o.invert_spd  = 1;
         else if (!strcmp(a, "--monitor"))                     o.monitor     = 1;
+        else if (!strcmp(a, "--csv"))                         o.csv         = 1;
         else if (!strcmp(a, "--gm-current"))                  o.gm_current_mode = 1;
         else if (!strcmp(a, "--gm-voltage"))                  o.gm_current_mode = 0;
         else if (!strcmp(a, "--filter-ms")   && i + 1 < argc) o.filter_ms   = atof(argv[++i]);
@@ -889,7 +893,7 @@ int main(int argc, char *argv[])
             if ((cycle % log_ms) == 0) {
                 const char *st = ctrl.enabled
                                  ? (ctrl.open_loop ? "开环" : "使能") : "失能";
-                if (g_ui.enabled) {
+                if (!o.csv && g_ui.enabled) {
                     /* 两行状态栏：单行排下来接近 100 列，80 列终端上会被截断 */
                     char l1[192], l2[192];
                     snprintf(l1, sizeof(l1),
@@ -902,7 +906,7 @@ int main(int argc, char *argv[])
                              m.rpm, rpm_tgt_last, m.temp, m.err, fb.roundtrip_us,
                              m.seen ? "" : "  (等反馈)");
                     ui_set_status_lines(l1, l2);
-                } else {
+                } else if (!o.csv) {
                     printf("[%s] 位置 %8.2f°→%8.2f°  转速 %5d[%5.0f]rpm  电流 %s  "
                            "%3u℃ E%u  %3dus%s\n",
                            st, motor_shaft_deg(&m, o.ratio), o.target_deg,
@@ -911,6 +915,13 @@ int main(int argc, char *argv[])
                                    tbuf, sizeof(tbuf)),
                            m.temp, m.err, fb.roundtrip_us,
                            m.seen ? "" : " (等反馈)");
+                    fflush(stdout);
+                }
+                if (o.csv) {
+                    printf("MOTOR_CSV,%.3f,%.4f,%.4f,%d,%.2f,%d,%.2f,%u,%d\n",
+                           cycle * dt, motor_shaft_deg(&m, o.ratio), o.target_deg,
+                           m.rpm, rpm_tgt_last, m.torque_raw, out_raw_f,
+                           m.temp, ctrl.enabled);
                     fflush(stdout);
                 }
             }

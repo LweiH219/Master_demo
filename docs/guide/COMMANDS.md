@@ -57,14 +57,16 @@ build/ecat2can_master <网卡> scan 3000
 ### 4. 发送一帧 CAN
 
 ```bash
-build/ecat2can_master <网卡> work <通道> <标准ID> <字节0> ... <字节7>
+build/ecat2can_master <网卡> work <通道> <标准ID> <字节0> ... <字节7> --hz=1000 --frames=2000
 ```
 
 示例：
 
 ```bash
-build/ecat2can_master enp3s0 work 3 0x123 11 22 33 44 55 66 77 88
+build/ecat2can_master enp3s0 work 3 0x123 11 22 33 44 55 66 77 88 --hz=500 --frames=1000
 ```
+
+`--hz` 设置 CAN 发送频率（1–1000 Hz），`--frames` 设置每个目标通道发送的帧数。EtherCAT PDO 仍以 1 kHz 运行，以保持从站通信周期；默认值为 1000 Hz、2000 帧。
 
 ### 5. 只读反馈
 
@@ -75,7 +77,7 @@ build/ecat2can_master <网卡> fdb 100
 ### 6. 多通道发送
 
 ```bash
-build/ecat2can_master <网卡> workall 0x123 00 00 00 00 00 00 00 00
+build/ecat2can_master <网卡> workall 0x123 00 00 00 00 00 00 00 00 --hz=1000 --frames=2000
 ```
 
 ### 7. 实时性和延迟

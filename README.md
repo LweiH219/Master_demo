@@ -1,6 +1,6 @@
 # Master_demo —— ECAT2CAN 主站测试工具
 
-本项目用于验证 ECAT2CAN EtherCAT↔CAN 从站。默认完整构建会同时生成核心程序 `ecat2can_master` 和 DJI 电机应用示例 `motor_pos`；前者负责从站状态、PDO、CAN 转发、多通道和实时性测试，后者用于验证 DJI 电机报文链路。
+本项目用于验证 ECAT2CAN EtherCAT↔CAN 从站。默认完整构建会生成图形工作台 `ecat2can_gui`、命令行核心 `ecat2can_master` 和 DJI 电机应用示例 `motor_pos`。图形工作台调用命令行核心执行诊断与测试；命令行也可独立用于自动化。
 
 ## 项目链路
 
@@ -32,6 +32,8 @@ build/                  CMake 构建目录（自动生成）
 cmake --preset default
 cmake --build --preset default
 ```
+
+默认会探测 Qt 5 并构建图形工作台。若未安装 Qt，命令行核心仍可构建；安装 `qtbase5-dev` 后重新运行配置即可启用 GUI。
 
 只构建主站核心时，在同一个目录关闭电机示例：
 
@@ -66,6 +68,9 @@ build/ecat2can_master <网卡> work 0 0x123 11 22 33 44 55 66 77 88
 
 # 查看反馈
 build/ecat2can_master <网卡> fdb 100
+
+# 打开图形化测试工作台
+build/ecat2can_gui
 ```
 
 EtherCAT 网卡应处于 `LOWER_UP`，并避免被 NetworkManager 管理。完整参数可直接查看：
@@ -80,6 +85,7 @@ build/motor_pos --help
 | 需求 | 文档 |
 | --- | --- |
 | 浏览完整文档分类 | [`docs/README.md`](docs/README.md) |
+| 图形工作台使用说明 | [`docs/guide/GUI.md`](docs/guide/GUI.md) |
 | 快速查命令和推荐测试顺序 | [`docs/guide/COMMANDS.md`](docs/guide/COMMANDS.md) |
 | 理解目录、依赖和测试分层 | [`docs/design/ARCHITECTURE.md`](docs/design/ARCHITECTURE.md) |
 | `looplat`、`rt`、`probe` 和指标解读 | [`docs/guide/RT_GUIDE.md`](docs/guide/RT_GUIDE.md) |
