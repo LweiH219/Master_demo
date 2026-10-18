@@ -1,6 +1,6 @@
 # Makefile —— ECAT2CAN 主机侧工具包（CMake 的便捷包装）
 #
-#   make              编译（内部走 cmake + ninja）
+#   make              一次编译主站和 DJI 电机示例（内部调用 CMake）
 #   make setcap       给两个程序加 raw socket 权限（需要 sudo 密码）
 #   make run ARGS="enp3s0 --motor gm6020 --ch 0 --monitor"
 #   make linktest ARGS="can0 enp3s0 40"
@@ -38,7 +38,7 @@ all: $(BINS)
 	@echo
 
 $(BINS): $(wildcard src/*.c src/*.h) CMakeLists.txt
-	@cmake $(GENFLAG) -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) > /dev/null
+	@cmake $(GENFLAG) -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) -DBUILD_DJI_MOTOR_TEST=ON > /dev/null
 	@$(BUILDER)
 
 # 让当前用户无需 sudo 就能开 raw socket（每次重新编译后都要跑一次）

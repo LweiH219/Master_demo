@@ -195,6 +195,12 @@ int ecx_closenic(ecx_portt *port)
    if ((port->redport) && (port->redport->sockhandle >= 0))
       close(port->redport->sockhandle);
 
+   /* ecx_setupnic() 初始化了主端口的收发互斥锁；重复扫描重开网卡时
+    * 必须销毁它们，避免每轮重试覆盖旧锁并泄漏 pthread 资源。 */
+   pthread_mutex_destroy(&(port->getindex_mutex));
+   pthread_mutex_destroy(&(port->tx_mutex));
+   pthread_mutex_destroy(&(port->rx_mutex));
+
    return 0;
 }
 

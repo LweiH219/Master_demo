@@ -1,5 +1,5 @@
 /*
- * motor_pos.c —— RoboMaster 电机位置闭环上位机（主机侧）
+ * motor_pos.c —— DJI 电机应用示例（用于验证 ECAT2CAN 的真实 CAN 转发）
  * ===========================================================================
  * 支持：M3508 + C620 电调 / GM6020（自带驱动器）
  *
@@ -23,7 +23,9 @@
  *     反馈 0x204+驱动器ID（0x205~0x20B），1kHz，布局与 C620 相同
  *     直驱无减速箱（减速比 1），绝对编码器
  *
- * 控制结构：位置环（轴角度 → 目标转速）串 速度环（rpm → 输出量）
+ * 控制结构：位置环（轴角度 → 目标转速）串 速度环（rpm → 输出量）。
+ * 本程序是应用层示例；ECAT2CAN 协议、从站状态机和实时性测试请使用
+ * ecat2can_master，不要把本程序视为主站核心。
  *   速度环内部统一用**原始计数**运算，这样两种电机的增益数值可以直接套用；
  *   对外的 --limit / c / m 才换算成物理量（m3508 用 A，gm6020 用计数）。
  *
@@ -57,195 +59,9 @@
 
 #include "soem/soem.h"
 #include "ecat2can_proto.h"
+#include "motor_control.h"
 
-/* ===================== 电机类型 ===================== */
-typedef enum {
-    MOTOR_M3508 = 0,   /* 配 C620 电调，电流控制 */
-    MOTOR_GM6020,      /* 自带驱动器，默认电压控制 */
-} motor_kind_t;
-
-/* ===================== 协议常量 ===================== */
-/* --- C620 / M3508 --- */
-#define C620_CTRL_ID_LO     0x200u   /* 电调 ID 1~4 */
-#define C620_CTRL_ID_HI     0x1FFu   /* 电调 ID 5~8 */
-#define C620_FB_ID_BASE     0x200u   /* 反馈 ID = 0x200 + 电调 ID */
-#define C620_CUR_RAW_MAX    16384.0f /* 控制值上限，对应 20A */
-#define C620_CUR_AMP_MAX    20.0f
-
-/* --- GM6020 --- */
-#define GM_CTRL_ID_LO_V     0x1FFu   /* 电压模式，驱动器 ID 1~4 */
-#define GM_CTRL_ID_HI_V     0x2FFu   /* 电压模式，驱动器 ID 5~7 */
-#define GM_CTRL_ID_LO_I     0x1FEu   /* 电流模式（需固件支持），ID 1~4 */
-#define GM_CTRL_ID_HI_I     0x2FEu   /* 电流模式，ID 5~7 */
-#define GM_FB_ID_BASE       0x204u   /* 反馈 ID = 0x204 + 驱动器 ID */
-#define GM_VOLT_RAW_MAX     25000.0f /* 电压给定值上限（手册只给了计数范围） */
-#define GM_CUR_RAW_MAX      16384.0f /* 电流给定值上限，对应 3A */
-#define GM_CUR_AMP_MAX      3.0f
-
-/* --- 反馈报文布局两种电机共用 --- */
-#define FB_IDX_ANGLE        0
-#define FB_IDX_RPM          2
-#define FB_IDX_TORQUE       4
-#define FB_IDX_TEMP         6
-#define FB_IDX_ERR          7   /* C620 是错误码；GM6020 此字节为 Null，恒 0 */
-
-#define ROTOR_CPR           8192.0f  /* 机械角度一圈 8192 */
-#define M3508_RATIO_DEF     (3591.0f / 187.0f)   /* ≈19.2032，官方标称 19 */
-
-#define FB_TIMEOUT_MS       100
-#define TEMP_LIMIT_C        100
-#define TARGET_LIMIT_DEG    7200.0f
-
-/* ===================== PID ===================== */
-typedef struct {
-    float kp, ki, kd;
-    float i_limit;
-    float out_limit;
-    float integ;
-    float prev_meas;
-    float d_lpf;        /* 微分项的一阶低通状态 */
-    float a_d;          /* 微分低通系数（1.0 = 不滤） */
-    float out;
-} pidc_t;
-
-/* 一阶低通系数：alpha = dt/(tau+dt)；tau<=0 表示不滤波 */
-static float lpf_alpha(float tau_s, float dt)
-{
-    if (tau_s <= 0.0f) return 1.0f;
-    return dt / (tau_s + dt);
-}
-
-static void pid_reset(pidc_t *p)
-{
-    p->integ = 0.0f;
-    p->prev_meas = 0.0f;
-    p->d_lpf = 0.0f;
-    p->out = 0.0f;
-}
-
-/* 微分作用在测量值上，避免改目标时产生冲击。
- *
- * 微分必须低通：位置是累积的 13 位机械角度，本身量化到 0.044°；
- * 而且电机反馈(1kHz)和 EtherCAT 周期(1kHz)不同步，网关偶尔会读到重复帧，
- * 使 (本次-上次) 在 0 和 2 倍之间跳 —— 不滤波的话微分项会变成几百 Hz 的方波，
- * 直接把电机嗡起来（实测踩过）。 */
-static float pid_step(pidc_t *p, float err, float meas, float dt)
-{
-    float d_raw;
-
-    p->integ += err * dt;
-    if (p->integ > p->i_limit) p->integ = p->i_limit;
-    if (p->integ < -p->i_limit) p->integ = -p->i_limit;
-
-    d_raw = -(meas - p->prev_meas) / dt;
-    p->prev_meas = meas;
-    p->d_lpf += p->a_d * (d_raw - p->d_lpf);
-
-    p->out = p->kp * err + p->ki * p->integ + p->kd * p->d_lpf;
-    if (p->out > p->out_limit) p->out = p->out_limit;
-    if (p->out < -p->out_limit) p->out = -p->out_limit;
-    return p->out;
-}
-
-/* ===================== 电机状态 ===================== */
-typedef struct {
-    uint16_t ecd, last_ecd;
-    int32_t  total_ecd;
-    int16_t  rpm;
-    int16_t  torque_raw;
-    uint8_t  temp;
-    uint8_t  err;
-    int      seen;
-    int      lost_ms;
-} motor_state_t;
-
-static void motor_decode(motor_state_t *m, const uint8_t *d)
-{
-    int32_t delta;
-
-    m->last_ecd   = m->ecd;
-    m->ecd        = (uint16_t)((d[FB_IDX_ANGLE] << 8) | d[FB_IDX_ANGLE + 1]);
-    m->rpm        = (int16_t)((d[FB_IDX_RPM] << 8) | d[FB_IDX_RPM + 1]);
-    m->torque_raw = (int16_t)((d[FB_IDX_TORQUE] << 8) | d[FB_IDX_TORQUE + 1]);
-    m->temp       = d[FB_IDX_TEMP];
-    m->err        = d[FB_IDX_ERR];
-
-    /* 13 位增量累积：机械角度每圈回绕 8192 */
-    delta = (int32_t)m->ecd - (int32_t)m->last_ecd;
-    if (delta >  4096) delta -= 8192;
-    if (delta < -4096) delta += 8192;
-    m->total_ecd += delta;
-
-    if (!m->seen) {
-        m->seen = 1;
-        m->total_ecd = 0;   /* 第一次收到时把当前位置当作 0，避免上电乱跳基准 */
-    }
-    m->lost_ms = 0;
-}
-
-static float motor_rotor_deg(const motor_state_t *m)
-{
-    return (float)m->total_ecd * (360.0f / ROTOR_CPR);
-}
-
-static float motor_shaft_deg(const motor_state_t *m, float ratio)
-{
-    return motor_rotor_deg(m) / ratio;
-}
-
-/* ===================== 电机配置（按类型推导协议参数） ===================== */
-typedef struct {
-    motor_kind_t kind;
-    int   id;
-    int   gm_current_mode;
-
-    uint32_t ctrl_id;
-    uint32_t fb_id;
-    int      ctrl_slot;
-    int      ctrl_slots;     /* 该控制报文有意义的槽位数（4 或 3） */
-    float    out_raw_max;    /* 输出量原始计数满量程 */
-    float    out_fs;         /* 满量程对应的物理量 */
-    const char *out_unit;    /* 物理量单位 */
-    /* 反馈里"实际转矩电流"那一栏的量纲（用于显示和可选的电流环）。
-     * GM6020 电压模式下输出的是电压，电流栏没有明确量纲，置 0 表示按原始计数显示 */
-    float    cur_raw_max;
-    float    cur_fs;
-} motor_cfg_t;
-
-static void motor_cfg_init(motor_cfg_t *c)
-{
-    if (c->kind == MOTOR_M3508) {
-        if (c->id < 1 || c->id > 8) { printf("M3508 的 ID 必须是 1~8\n"); exit(1); }
-        c->ctrl_id     = (c->id <= 4) ? C620_CTRL_ID_LO : C620_CTRL_ID_HI;
-        c->ctrl_slots  = 4;
-        c->fb_id       = C620_FB_ID_BASE + (uint32_t)c->id;
-        c->out_raw_max = C620_CUR_RAW_MAX;
-        c->out_fs      = C620_CUR_AMP_MAX;
-        c->out_unit    = "A";
-        c->cur_raw_max = C620_CUR_RAW_MAX;
-        c->cur_fs      = C620_CUR_AMP_MAX;
-    } else {
-        if (c->id < 1 || c->id > 7) { printf("GM6020 的 ID 必须是 1~7\n"); exit(1); }
-        if (c->gm_current_mode) {
-            c->ctrl_id     = (c->id <= 4) ? GM_CTRL_ID_LO_I : GM_CTRL_ID_HI_I;
-            c->out_raw_max = GM_CUR_RAW_MAX;
-            c->out_fs      = GM_CUR_AMP_MAX;
-            c->out_unit    = "A";
-            c->cur_raw_max = GM_CUR_RAW_MAX;
-            c->cur_fs      = GM_CUR_AMP_MAX;
-        } else {
-            c->ctrl_id     = (c->id <= 4) ? GM_CTRL_ID_LO_V : GM_CTRL_ID_HI_V;
-            c->out_raw_max = GM_VOLT_RAW_MAX;
-            c->out_fs      = GM_VOLT_RAW_MAX;
-            c->out_unit    = "计数";
-            c->cur_raw_max = 0.0f;   /* 电压模式下电流栏无明确量纲 */
-            c->cur_fs      = 0.0f;
-        }
-        c->ctrl_slots = (c->id <= 4) ? 4 : 3;
-        c->fb_id      = GM_FB_ID_BASE + (uint32_t)c->id;
-    }
-    c->ctrl_slot = (c->id - 1) % 4;
-}
+/* 电机协议、反馈解码和 PID 实现在 motor_control.c；本文件只编排 UI、现场总线和周期调度。 */
 
 /* ===================== 终端 UI =====================
  * 把终端最后一行留给状态显示：滚动区设为 1..rows-1，状态行画在第 rows 行。
@@ -253,14 +69,14 @@ static void motor_cfg_init(motor_cfg_t *c)
  * stdout 不是 tty（重定向到文件/管道）时自动退化为逐行打印。
  */
 typedef struct {
-    int  enabled;
-    int  rows;
-    int  width;
-    int  top;               /* 滚动区最后一行（提示符所在行） */
-    char status1[256];      /* 底部状态栏第一行 */
-    char status2[256];      /* 底部状态栏第二行 */
-    char input[80];
-    size_t input_len;
+    int  enabled;           /* 是否启用 ANSI 固定状态栏。 */
+    int  rows;              /* 终端行数。 */
+    int  width;             /* 用于截断状态文本的终端宽度。 */
+    int  top;               /* 滚动区最后一行，也就是提示符所在行。 */
+    char status1[256];      /* 固定状态栏第一行。 */
+    char status2[256];      /* 固定状态栏第二行。 */
+    char input[80];         /* 当前提示符显示的输入行副本。 */
+    size_t input_len;       /* input 中的有效字节数。 */
 } ui_t;
 
 static ui_t g_ui;
@@ -357,12 +173,12 @@ static void ui_set_status_lines(const char *l1, const char *l2)
 
 /* ===================== 现场总线 ===================== */
 typedef struct {
-    ecx_contextt ctx;
-    const char  *iface;
-    uint8_t      map[4096];
-    int          roundtrip_us;
-    int          obytes, ibytes;
-    int          expected_wkc;
+    ecx_contextt ctx;       /* SOEM 上下文及已发现的从站状态。 */
+    const char  *iface;     /* 传给 SOEM 的 Linux 网卡名。 */
+    uint8_t      map[4096]; /* SOEM PDO 映射使用的工作区。 */
+    int          roundtrip_us; /* 最近一次收发往返耗时。 */
+    int          obytes, ibytes; /* 映射后的下行/上行 PDO 字节数。 */
+    int          expected_wkc; /* 正常过程数据交换时的期望 WKC。 */
 } fieldbus_t;
 
 static volatile sig_atomic_t g_stop = 0;
@@ -452,25 +268,25 @@ static void fb_close(fieldbus_t *fb)
 
 /* ===================== 运行参数 ===================== */
 typedef struct {
-    motor_kind_t kind;
-    int   id;
-    int   ch;               /* CAN 通道号 0~3（ECAN-Lite 四路全引出） */
-    float ratio;
-    int   ratio_given;
-    float target_deg;
-    float limit;            /* 输出限幅，物理单位（A / 计数） */
-    int   limit_given;
-    float max_rpm;
-    int   log_ms;
-    int   invert_spd;
-    int   monitor;
-    int   gm_current_mode;
-    float filter_ms;        /* 反馈低通时间常数（ms），0 = 不滤 */
-    int   cur_loop;         /* host 侧电流环（默认关，见文档说明） */
-    unsigned gain_given;    /* 位标记：哪些增益被命令行显式指定过 */
-    float pos_kp, pos_ki, pos_kd;
-    float spd_kp, spd_ki, spd_kd;
-    float cur_kp, cur_ki;
+    motor_kind_t kind;      /* M3508/C620 或 GM6020 协议类型。 */
+    int   id;               /* CAN 总线上的电机/驱动器 ID，从 1 开始。 */
+    int   ch;               /* CAN 通道 0~3，ECAN-Lite 有四路通道。 */
+    float ratio;            /* 转子转数与输出轴转数之比。 */
+    int   ratio_given;      /* 是否显式指定 --ratio，否则使用机型默认值。 */
+    float target_deg;       /* 输出轴目标角度，不是转子角度。 */
+    float limit;            /* 当前物理单位下的输出限幅（A 或计数）。 */
+    int   limit_given;      /* 是否显式指定 --limit，否则使用机型/模式默认值。 */
+    float max_rpm;          /* 位置环输出限幅，单位为转子 rpm。 */
+    int   log_ms;           /* 非交互输出的状态打印周期，单位毫秒。 */
+    int   invert_spd;       /* 按需要反转反馈转速符号。 */
+    int   monitor;          /* 只读模式，强制禁止输出。 */
+    int   gm_current_mode;  /* GM6020：1 为电流模式(0x1FE/0x2FE)，0 为电压模式。 */
+    float filter_ms;        /* 反馈低通时间常数，不是采样周期；0 表示关闭。 */
+    int   cur_loop;         /* 可选的主机侧电流环，默认关闭。 */
+    unsigned gain_given;    /* 位掩码，记录命令行显式指定过的增益。 */
+    float pos_kp, pos_ki, pos_kd; /* 位置环增益，输入为输出轴角度误差。 */
+    float spd_kp, spd_ki, spd_kd; /* 速度环增益，输入单位为 rpm。 */
+    float cur_kp, cur_ki;   /* 可选主机侧电流环增益。 */
 } opts_t;
 
 static void usage(const char *p)
@@ -539,14 +355,14 @@ static void usage(const char *p)
 "  %s enp3s0 --motor gm6020 --id 1 --limit 1\n"
 "  %s enp3s0 --motor gm6020 --id 1 --gm-voltage --limit 3000\n",
     p, ECAT2CAN_CAN_CHANNEL_MAX, ECAT2CAN_CAN_CHANNEL_DEFAULT,
-    M3508_RATIO_DEF, p, p, p);
+    MOTOR_M3508_RATIO_DEF, p, p, p);
 }
 
 /* ===================== 运行时控制台 ===================== */
 typedef struct {
-    int   enabled;
-    int   open_loop;
-    float ol_out;       /* 开环输出（物理单位，同 --limit） */
+    int   enabled;        /* 用户按 e 后才允许输出。 */
+    int   open_loop;      /* 旁路位置/速度 PID，直接测试指令输出。 */
+    float ol_out;         /* 开环指令，单位与 --limit 相同。 */
 } ctrl_t;
 
 static void print_help(void)
@@ -587,8 +403,8 @@ static void handle_cmd(const char *line, opts_t *o, const motor_cfg_t *cfg,
     /* --- 纯数字 = 目标位置 --- */
     if ((c0 >= '0' && c0 <= '9') || c0 == '-' || c0 == '+' || c0 == '.') {
         float t = atof(line);
-        if (t >  TARGET_LIMIT_DEG) t =  TARGET_LIMIT_DEG;
-        if (t < -TARGET_LIMIT_DEG) t = -TARGET_LIMIT_DEG;
+        if (t >  MOTOR_TARGET_LIMIT_DEG) t =  MOTOR_TARGET_LIMIT_DEG;
+        if (t < -MOTOR_TARGET_LIMIT_DEG) t = -MOTOR_TARGET_LIMIT_DEG;
         o->target_deg = t;
         ui_msg("[目标] %.2f°(输出轴) = 转子 %.1f°", t, t * o->ratio);
         return;
@@ -602,7 +418,7 @@ static void handle_cmd(const char *line, opts_t *o, const motor_cfg_t *cfg,
             return;
         }
         c->enabled = 1;
-        pid_reset(pp); pid_reset(ps);
+        motor_pid_reset(pp); motor_pid_reset(ps);
         o->target_deg = motor_shaft_deg(m, o->ratio);   /* 关键安全动作 */
         ui_msg("[使能] 目标先设为当前位置 %.2f°，积分已清零", o->target_deg);
     } else if (!strcmp(cmd, "d")) {
@@ -677,7 +493,7 @@ int main(int argc, char *argv[])
         .kind = MOTOR_M3508,
         .id = 1,
         .ch = ECAT2CAN_CAN_CHANNEL_DEFAULT,
-        .ratio = M3508_RATIO_DEF,
+        .ratio = MOTOR_M3508_RATIO_DEF,
         .ratio_given = 0,
         .target_deg = 0.0f,
         .limit = 3.0f,
@@ -701,16 +517,17 @@ int main(int argc, char *argv[])
     int      i, quiet_cycles;
     float    prev_err = 0.0f;
     int      diverging = 0;
-    float    dt = 0.001f;
+    float    dt = 0.001f;        /* 固定控制周期：1 ms（1 kHz）。 */
     long     cycle = 0;
     struct timespec next, now;
     int      fb_lost_warned = 0;
     int      last_fb_seen = 0;
     char     tbuf[32];
-    /* 反馈低通 + 自激检测 + 可选电流环 */
+    /* 反馈低通滤波、自激检测和可选主机侧电流环。 */
     float    a_rpm, a_d_coef;
     float    rpm_filt = 0.0f;
     float    rpm_used = 0.0f;
+    /* 若当前协议提供安培量程，下面三个电流环变量均使用安培。 */
     float    cur_ref_a = 0.0f, cur_meas_a = 0.0f, cur_cmd_a = 0.0f;
     float    rpm_tgt_last = 0.0f;
     int      osc_flips = 0, osc_prev_sign = 0, osc_warned = 0;
@@ -759,7 +576,7 @@ int main(int argc, char *argv[])
     }
 
     /* ---- 按电机类型补默认值 / 校验 ---- */
-    if (!o.ratio_given) o.ratio = (o.kind == MOTOR_M3508) ? M3508_RATIO_DEF : 1.0f;
+    if (!o.ratio_given) o.ratio = (o.kind == MOTOR_M3508) ? MOTOR_M3508_RATIO_DEF : 1.0f;
     if (!o.limit_given) {
         if (o.kind == MOTOR_M3508)            o.limit = 3.0f;
         else if (o.gm_current_mode)           o.limit = 1.0f;   /* GM6020 电流满量程只有 3A */
@@ -771,7 +588,7 @@ int main(int argc, char *argv[])
      *                  增益必须保守，否则高频自激（实测踩过） */
     if (o.kind == MOTOR_M3508) {
         if (!(o.gain_given &  1u)) o.pos_kp = 8.0f;
-        if (!(o.gain_given &  4u)) o.pos_kd = 0.0f;   /* 微分默认关，见 pid_step 注释 */
+        if (!(o.gain_given &  4u)) o.pos_kd = 0.0f;   /* 微分默认关，见 motor_pid_step 注释 */
         if (!(o.gain_given &  8u)) o.spd_kp = 20.0f;
         if (!(o.gain_given & 16u)) o.spd_ki = 0.2f;
     } else {
@@ -791,22 +608,25 @@ int main(int argc, char *argv[])
     }
     if (o.ratio <= 0.01f) { printf("--ratio 必须 > 0\n"); return 1; }
     if (o.limit < 0.0f)   { printf("--limit 不能为负\n"); return 1; }
-    if (o.target_deg > TARGET_LIMIT_DEG || o.target_deg < -TARGET_LIMIT_DEG) {
-        printf("--target 超出 ±%.0f°，已限幅\n", TARGET_LIMIT_DEG);
-        o.target_deg = (o.target_deg > 0) ? TARGET_LIMIT_DEG : -TARGET_LIMIT_DEG;
+    if (o.target_deg > MOTOR_TARGET_LIMIT_DEG || o.target_deg < -MOTOR_TARGET_LIMIT_DEG) {
+        printf("--target 超出 ±%.0f°，已限幅\n", MOTOR_TARGET_LIMIT_DEG);
+        o.target_deg = (o.target_deg > 0) ? MOTOR_TARGET_LIMIT_DEG : -MOTOR_TARGET_LIMIT_DEG;
     }
 
     cfg.kind = o.kind;
     cfg.id = o.id;
     cfg.gm_current_mode = o.gm_current_mode;
-    motor_cfg_init(&cfg);
+    if (motor_cfg_init(&cfg) != 0) {
+        printf("电机 ID 超出该型号支持范围\n");
+        return 1;
+    }
     if (o.limit > cfg.out_fs) {
         printf("--limit %.3f 超出 %s 满量程 %.0f，已限幅\n", o.limit, cfg.out_unit, cfg.out_fs);
         o.limit = cfg.out_fs;
     }
 
-    a_d_coef = lpf_alpha(o.filter_ms / 1000.0f, dt);
-    a_rpm    = lpf_alpha(o.filter_ms / 1000.0f, dt);
+    a_d_coef = motor_lpf_alpha(o.filter_ms / 1000.0f, dt);
+    a_rpm    = motor_lpf_alpha(o.filter_ms / 1000.0f, dt);
 
     pid_pos = (pidc_t){ .kp = o.pos_kp, .ki = o.pos_ki, .kd = o.pos_kd,
                         .i_limit = 200.0f, .out_limit = o.max_rpm, .a_d = a_d_coef };
@@ -818,7 +638,7 @@ int main(int argc, char *argv[])
                         .out_limit = cfg.cur_fs > 0.0f ? cfg.cur_fs : 1.0f,
                         .a_d = 1.0f };
 
-    memset(&m, 0, sizeof(m));
+    motor_state_reset(&m);
 
     /* ---- 打印配置 ---- */
     printf("=== RoboMaster 电机位置闭环 ===\n");
@@ -895,14 +715,14 @@ int main(int argc, char *argv[])
         ecat2can_tx_rx_message *irx = (ecat2can_tx_rx_message *)in;
         int wkc, n;
         float out_raw_f = 0.0f;                       /* PID/开环输出，原始计数 */
-        float raw_lim   = o.limit / cfg.out_fs * cfg.out_raw_max;
+        float raw_lim   = motor_physical_to_raw(&cfg, o.limit, o.limit);
 
         /* ---------- 1. 解析上行 PDO 里的反馈 ---------- */
         m.lost_ms += 1;
         for (n = 0; n < (int)irx->frame_count && n < (int)ECAT2CAN_MAX_FRAME_COUNT; n++) {
             const can_frame_struct *f = &irx->can_frames[n];
             if (f->std_id == cfg.fb_id && f->dlc == 8) {
-                motor_decode(&m, f->data);
+                motor_state_decode(&m, f->data);
             }
         }
 
@@ -942,17 +762,18 @@ int main(int argc, char *argv[])
         if (o.monitor) ctrl.enabled = 0;
 
         if (ctrl.enabled) {
-            if (!m.seen || m.lost_ms > FB_TIMEOUT_MS) {
+            motor_fault_t fault = motor_state_fault(&m);
+            if (fault == MOTOR_FAULT_FEEDBACK_TIMEOUT) {
                 if (!fb_lost_warned) {
-                    ui_msg("!! 超过 %d ms 收不到反馈，已切断输出。"
-                           "检查电机供电 / CAN 接线 / --id", FB_TIMEOUT_MS);
+                    ui_msg("!! 超过 %d ms 收不到反馈，已切断输出。检查电机供电 / CAN 接线 / --id",
+                           MOTOR_FB_TIMEOUT_MS);
                     fb_lost_warned = 1;
                 }
                 ctrl.enabled = 0;
-            } else if (m.temp >= TEMP_LIMIT_C) {
-                ui_msg("!! 电机温度 %u℃ 超过 %d℃，已切断输出", m.temp, TEMP_LIMIT_C);
+            } else if (fault == MOTOR_FAULT_OVERTEMP) {
+                ui_msg("!! 电机温度 %u℃ 超过 %d℃，已切断输出", m.temp, MOTOR_TEMP_LIMIT_C);
                 ctrl.enabled = 0;
-            } else if (m.err != 0) {
+            } else if (fault == MOTOR_FAULT_DRIVER) {
                 ui_msg("!! 驱动器报错误码 %u，已切断输出", m.err);
                 ctrl.enabled = 0;
             }
@@ -962,9 +783,9 @@ int main(int argc, char *argv[])
         /* ---------- 4. 闭环 ---------- */
         cur_ref_a = 0.0f;
         if (ctrl.enabled && ctrl.open_loop) {
-            out_raw_f = ctrl.ol_out / cfg.out_fs * cfg.out_raw_max;
+            out_raw_f = motor_physical_to_raw(&cfg, ctrl.ol_out, o.limit);
             cur_ref_a = ctrl.ol_out;
-            pid_reset(&pid_pos); pid_reset(&pid_spd); pid_reset(&pid_cur);
+            motor_pid_reset(&pid_pos); motor_pid_reset(&pid_spd); motor_pid_reset(&pid_cur);
             rpm_filt = o.invert_spd ? -(float)m.rpm : (float)m.rpm;
             rpm_used = rpm_filt;
             diverging = 0; prev_err = 0.0f;
@@ -980,7 +801,7 @@ int main(int argc, char *argv[])
             rpm_filt += a_rpm * (rpm_raw - rpm_filt);
             rpm_used  = rpm_filt;
 
-            rpm_tgt = pid_step(&pid_pos, err, pos_deg, dt);
+            rpm_tgt = motor_pid_step(&pid_pos, err, pos_deg, dt);
             rpm_tgt_last = rpm_tgt;
 
             /* 发散保护：误差连续变大说明某个环的符号反了，别让电机一直顶 */
@@ -996,15 +817,15 @@ int main(int argc, char *argv[])
             }
             prev_err = err;
 
-            out_raw_f = pid_step(&pid_spd, rpm_tgt - rpm_used, rpm_used, dt);
-            cur_ref_a = out_raw_f / cfg.out_raw_max * cfg.out_fs;
+            out_raw_f = motor_pid_step(&pid_spd, rpm_tgt - rpm_used, rpm_used, dt);
+            cur_ref_a = motor_raw_to_physical(&cfg, out_raw_f);
         } else {
             out_raw_f = 0.0f;
             rpm_tgt_last = 0.0f;
             diverging = 0;
-            pid_reset(&pid_pos);
-            pid_reset(&pid_spd);
-            pid_reset(&pid_cur);
+            motor_pid_reset(&pid_pos);
+            motor_pid_reset(&pid_spd);
+            motor_pid_reset(&pid_cur);
             rpm_filt = o.invert_spd ? -(float)m.rpm : (float)m.rpm;
             rpm_used = rpm_filt;
         }
@@ -1015,7 +836,7 @@ int main(int argc, char *argv[])
          * 用慢环套快环只会增加滞后、让系统更不稳。留这个开关是为了做对比实验。 */
         if (ctrl.enabled && o.cur_loop && cfg.cur_fs > 0.0f) {
             cur_meas_a = m.torque_raw / cfg.cur_raw_max * cfg.cur_fs;
-            cur_cmd_a  = pid_step(&pid_cur, cur_ref_a - cur_meas_a, cur_meas_a, dt);
+            cur_cmd_a  = motor_pid_step(&pid_cur, cur_ref_a - cur_meas_a, cur_meas_a, dt);
             out_raw_f  = cur_cmd_a / cfg.out_fs * cfg.out_raw_max;
         }
 

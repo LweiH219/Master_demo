@@ -1,6 +1,9 @@
 # 构建产物
 build/
 compile_commands.json
+CMakeUserPresets.json
+__pycache__/
+*.py[cod]
 
 # 目标文件与二进制（若在源码目录里直接编译）
 *.o

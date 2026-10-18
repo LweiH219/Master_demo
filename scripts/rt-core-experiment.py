@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Temporary core reservation experiment; restores every changed setting."""
 import os,sys,pathlib,subprocess,json,signal
-root=pathlib.Path('/home/tide/Master_demo')
+root=pathlib.Path(__file__).resolve().parents[1]
 state=pathlib.Path(sys.argv[1]);state.mkdir(parents=True,exist_ok=True)
 saved=[]
 def change(path,value):

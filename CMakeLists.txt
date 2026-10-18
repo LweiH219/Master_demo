@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.28)
 project(ecat2can_host LANGUAGES C)
 
+option(BUILD_DJI_MOTOR_TEST "Build the optional DJI motor application example" ON)
+
 # -----------------------------------------------------------------------------
 #  ECAT2CAN 主机侧工具包（完全自包含）
 #
@@ -30,19 +32,28 @@ set(SOEM_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/SOEM EXCLUDE_FROM_ALL)
 
 # ---- 工具 ---------------------------------------------------------------
-add_executable(ecat2can_master src/ecat2can_master.c)
+add_executable(ecat2can_master
+  src/ecat2can_master.c
+  src/ecat2can_fieldbus.c
+  src/ecat2can_rt.c
+)
 target_include_directories(ecat2can_master PRIVATE src)
 target_link_libraries(ecat2can_master PRIVATE soem m)
 target_compile_options(ecat2can_master PRIVATE -Wall -Wextra)
 
-add_executable(motor_pos src/motor_pos.c)
-target_include_directories(motor_pos PRIVATE src)
-target_link_libraries(motor_pos PRIVATE soem m)
-target_compile_options(motor_pos PRIVATE -Wall -Wextra)
+if(BUILD_DJI_MOTOR_TEST)
+  add_executable(motor_pos src/motor_pos.c src/motor_control.c)
+  target_include_directories(motor_pos PRIVATE src)
+  target_link_libraries(motor_pos PRIVATE soem m)
+  target_compile_options(motor_pos PRIVATE -Wall -Wextra)
+endif()
 
 # ---- 安装 ---------------------------------------------------------------
 include(GNUInstallDirs)
-install(TARGETS ecat2can_master motor_pos RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS ecat2can_master RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+if(BUILD_DJI_MOTOR_TEST)
+  install(TARGETS motor_pos RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
 install(PROGRAMS scripts/can-linktest.sh DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES README.md DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
@@ -52,5 +63,5 @@ message(STATUS "  构建类型 : ${CMAKE_BUILD_TYPE}")
 message(STATUS "  SOEM     : 内置（third_party/SOEM）")
 message(STATUS "")
 message(STATUS "  构建后记得给二进制加 raw socket 权限：")
-message(STATUS "      make setcap      （或 sudo setcap cap_net_raw,cap_net_admin+eip <程序>）")
+message(STATUS "      sudo setcap cap_net_raw,cap_net_admin+eip <程序>")
 message(STATUS "")

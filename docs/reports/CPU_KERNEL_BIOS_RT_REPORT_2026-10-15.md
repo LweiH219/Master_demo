@@ -1,5 +1,8 @@
 # CPU 绑定、内核与 BIOS 实时性优化（2026-10-15）
 
+> 文档类型：历史测试报告  | 测试日期：2026-10-15  | 状态：历史记录
+
+
 ## 主机与实验边界
 
 主机为 Thunderobot MIX NUC II，i7-13620H，BIOS American Megatrends 5.27（2025-08-21），Ubuntu PREEMPT_RT 6.8.1-1060-realtime。CPU4/5 与 CPU6/7 分别为同一物理 P 核的两个 SMT 线程。控制程序绑定 CPU4、FIFO40；enp3s0 接收 NAPI 绑定 CPU6、FIFO90；performance governor、关闭 Turbo。该基础配置来自之前的端到端实测筛选。
