@@ -54,15 +54,66 @@ build/ecat2can_master <网卡> loop 1000
 build/ecat2can_master <网卡> scan 3000
 ```
 
-### 4. 发送一帧 CAN
+### 4. 发送 CAN 帧
+
+#### 单帧 `send`
+
+`send` 默认只发 1 帧，并且**逐帧**打印往返时间、WKC、从站状态和本拍从 CAN
+收到的帧数，适合"我就要发这一帧，看清楚到底发生了什么"的场合。
 
 ```bash
-build/ecat2can_master <网卡> work <通道> <标准ID> <字节0> ... <字节7>
+build/ecat2can_master <网卡> send <通道> <标准ID> <字节0> ... <字节7>
 ```
 
 示例：
 
 ```bash
+build/ecat2can_master enp3s0 send 3 0x123 11 22 33 44 55 66 77 88
+```
+
+输出样例：
+
+```text
+SEND：通道 3  ID 0x123  DLC 8  data = 11 22 33 44 55 66 77 88  共 1 帧
+  第   1 帧  往返  55 us  WKC 3/3  从站状态 0x00  本拍从 CAN 收到 0 帧
+完成：1/1 帧 WKC 正常（从站在这些拍里共收到 0 帧 CAN 报文）
+```
+
+> **单帧很难观察**：一帧标准帧在 1 Mbps 总线上只持续约 130 µs，`candump`
+> 必须提前启动才抓得到，板上的活动指示灯也只亮 50 ms。要稳定观察发送，
+> 请用下面的多帧方式。
+>
+> 另外，输出里的"本拍从 CAN 收到 N 帧"是**接收**指标（从站这一拍从总线上
+> 收到了几帧），不是发送计数。
+
+#### 多帧 `send` + `ECAT2CAN_SEND_COUNT`
+
+帧数用环境变量控制，不占用 8 个数据字节的参数位置：
+
+```bash
+# 连发 100 帧（约 100 ms 持续流量，candump 和指示灯都能稳定观察到）
+ECAT2CAN_SEND_COUNT=100 build/ecat2can_master enp3s0 send 3 0x123 11 22 33 44 55 66 77 88
+
+# 连发 15000 帧（约 15 秒）
+ECAT2CAN_SEND_COUNT=15000 build/ecat2can_master enp3s0 send 3 0x123 11 22
+```
+
+配合另一台 CAN 分析仪观察：
+
+```bash
+# 终端 1：先启动监听
+candump can0
+
+# 终端 2：连发
+ECAT2CAN_SEND_COUNT=100 build/ecat2can_master enp3s0 send 3 0x123 11 22 33 44 55 66 77 88
+```
+
+#### 压测 `work`
+
+`work` 固定发 2000 轮（约 2 秒、1 kHz），只打印前几轮，用来压测和检查长时稳定性：
+
+```bash
+build/ecat2can_master <网卡> work <通道> <标准ID> <字节0> ... <字节7>
 build/ecat2can_master enp3s0 work 3 0x123 11 22 33 44 55 66 77 88
 ```
 
@@ -106,7 +157,8 @@ build/motor_pos <网卡> --motor gm6020 --ch 3 --id 1 --monitor
 | 确认从站是否在线 | `info` |
 | 验证 192 字节 PDO | `loop` |
 | 查找 CAN 设备所在通道 | `scan` |
-| 主站向 CAN 发帧 | `work` / `workall` |
+| 主站向 CAN 发**单帧**（逐帧打印细节） | `send` |
+| 主站向 CAN 连续发帧 / 压测 | `work`（2000 帧） / `workall`（四路各一帧）|
 | 查看 CAN 反馈 | `fdb` |
 | 测量 EtherCAT/CAN 性能 | `bench` |
 | 测量主机调度 | `rt ... host` |

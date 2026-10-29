@@ -148,11 +148,31 @@ static int cmd_info(fieldbus_t *fb)
 {
     int disp_tick = 0;
     int tick = 0;
+    ec_groupt *grp0 = fb->ctx.grouplist + 0;
+    ecat2can_tx_rx_message *out = FB_OUT(fb, grp0);
 
     while (!g_stop) {
         ec_groupt *grp = fb->ctx.grouplist + 0;
         int expected_wkc = grp->outputsWKC * 2 + grp->inputsWKC;
-        int wkc = fb_roundtrip(fb);
+        int wkc;
+
+        /*
+         * ★ 每轮下发 WORK_MODE 且 frame_count = 0。
+         *
+         * 原因：从站只有收到 WORK_MODE / ONLY_FDB 才会去读 CAN 接收 FIFO
+         * （见固件 ecat2can_process() 的 switch）。原来 info 从不设置 command，
+         * 从站按 LOOP_TEST 处理，根本不碰 CAN —— 于是另一台 PCAN 在总线上一直
+         * 发帧时，板上的活动指示灯完全不亮，看起来像"灯坏了"，其实是 info
+         * 没有让从站去读 CAN。
+         *
+         * frame_count = 0 表示不下发任何 CAN 帧，所以对总线是纯监听、不干扰。
+         */
+        memset(out, 0, ECAT2CAN_PDO_BYTES);
+        out->command = WORK_MODE;
+        out->frame_count = 0u;
+        out->seq = (uint8_t)tick;
+
+        wkc = fb_roundtrip(fb);
 
         /* slavelist[1].state 只有 readstate/statecheck 才会刷新，定期读一次 */
         if (++tick % 20 == 0) {
@@ -300,6 +320,17 @@ static int work_channels(fieldbus_t *fb, const uint8_t *chs, int nch,
     ecat2can_tx_rx_message *out = FB_OUT(fb, grp);
     const ecat2can_tx_rx_message *in = FB_IN(fb, grp);
     int i, k, round, last_count = -1;
+    unsigned base_seq;
+    struct timespec ts;
+
+    /* seq 起始值随机化 —— 理由见 cmd_send() 里的说明。
+     * work 一轮 2000 拍会覆盖 0..255 好几个来回，一般看不出问题；但如果
+     * cycles 很小，同样会出现"第二次不发"。 */
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    base_seq = (unsigned)(ts.tv_nsec / 1000) & 0xFFu;
+    if (base_seq == 0u) {
+        base_seq = 1u;
+    }
 
     printf("WORK_MODE：周期 1 kHz 下发 CAN 帧（%d 次）\n", cycles);
     printf("  通道 = ");
@@ -317,7 +348,7 @@ static int work_channels(fieldbus_t *fb, const uint8_t *chs, int nch,
         memset(out, 0, ECAT2CAN_PDO_BYTES);
         out->command = WORK_MODE;
         out->frame_count = (uint8_t)nch;
-        out->seq = (uint8_t)round;
+        out->seq = (uint8_t)(base_seq + (unsigned)round);
         for (k = 0; k < nch; k++) {
             build_frame(out, k, chs[k], id, data, len);
         }
@@ -339,6 +370,92 @@ static int cmd_work(fieldbus_t *fb, uint8_t ch, uint32_t id,
                     const uint8_t *data, int len, int cycles)
 {
     return work_channels(fb, &ch, 1, id, data, len, cycles);
+}
+
+/*
+ * 单帧/小批量发送：send <通道> <id> [b0..b7]
+ *
+ * 和 work 的区别：
+ *   work  固定 2000 轮（2 秒），只在前几轮打印，用来压测
+ *   send  默认只发 1 帧，而且每帧都打印往返时间 / WKC / 从站状态 / 回传帧数，
+ *         适合"我就要发这一帧，看清楚它到底发生了什么"的场合。
+ *
+ * 帧数用环境变量控制，避免和 8 个数据字节抢参数位置：
+ *   ECAT2CAN_SEND_COUNT=10 send 2 0x123 11 22
+ */
+static int cmd_send(fieldbus_t *fb, uint8_t ch, uint32_t id,
+                    const uint8_t *data, int len, int count)
+{
+    ec_groupt *grp = fb->ctx.grouplist + 0;
+    ecat2can_tx_rx_message *out = FB_OUT(fb, grp);
+    const ecat2can_tx_rx_message *in = FB_IN(fb, grp);
+    int expected_wkc = grp->outputsWKC * 2 + grp->inputsWKC;
+    int i, round, ok = 0, echoes = 0;
+    unsigned base_seq;
+    struct timespec ts;
+
+    /*
+     * ★ seq 起始值取时间戳低 8 位，而不是固定从 0 开始。
+     *
+     * 从站只在「本拍 seq 与上次不同」时才把帧发到 CAN 总线上（见固件
+     * ecat2can_process() 的 WORK_MODE 分支）。如果每条命令都从 seq=0 开始，
+     * 那么 count=1 时每次都是 seq=0 —— 第二次运行和上一次相同，从站认为
+     * "数据没变"，一个字节都不发。现象就是"第一次能发，第二次就发不出去"。
+     *
+     * 起始值随机化后，连续运行两次的 seq 序列必然不同，从站每次都会真发。
+     */
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    base_seq = (unsigned)(ts.tv_nsec / 1000) & 0xFFu;
+    if (base_seq == 0u) {
+        base_seq = 1u;
+    }
+
+    printf("SEND：通道 %u  ID 0x%03X  DLC %d  data =", ch, id, len);
+    for (i = 0; i < len && i < 8; i++) {
+        printf(" %02X", data[i]);
+    }
+    printf("  共 %d 帧\n", count);
+
+    for (round = 0; round < count && !g_stop; round++) {
+        int wkc;
+
+        memset(out, 0, ECAT2CAN_PDO_BYTES);
+        out->command = WORK_MODE;
+        out->frame_count = 1u;
+        out->seq = (uint8_t)(base_seq + (unsigned)round);
+        build_frame(out, 0, ch, id, data, len);
+
+        wkc = fb_roundtrip(fb);
+
+        if (wkc == expected_wkc) {
+            ok++;
+        }
+        echoes += in->frame_count;
+
+        printf("  第 %3d 帧  往返 %3d us  WKC %d/%d  从站状态 0x%02X  "
+               "本拍从 CAN 收到 %d 帧\n",
+               round + 1, fb->roundtrip_us, wkc, expected_wkc,
+               in->status, in->frame_count);
+        fflush(stdout);
+
+        osal_usleep(1000);
+    }
+
+    printf("完成：%d/%d 帧 WKC 正常（从站在这些拍里共收到 %d 帧 CAN 报文）\n",
+           ok, count, echoes);
+
+    /*
+     * 单帧很容易"看起来没发出去"：一帧标准帧在 1 Mbps 总线上只占约 130 us，
+     * candump 必须恰好开着才能抓到，板上的活动灯也只亮 LED_HOLD_MS（50 ms）。
+     * 这不是失败，只是太快了，所以在这里直说怎么稳定观察。
+     */
+    if (count == 1) {
+        printf("提示：单帧在 1 Mbps 总线上只持续约 130 us ——\n"
+               "      candump 需提前启动才能抓到，活动灯也只亮 50 ms。\n"
+               "      要稳定观察，用 ECAT2CAN_SEND_COUNT=100 连发，例如：\n"
+               "        ECAT2CAN_SEND_COUNT=100 <主站程序> <网卡> send <ch> <id> [b0..b7]\n");
+    }
+    return 0;
 }
 
 /* 在 4 个通道上各发一帧 —— 用来找"设备到底挂在哪一路"，
@@ -1959,6 +2076,44 @@ int main(int argc, char *argv[])
             rx < 0 || rx > 3 || lp_freq < 100 || lp_freq > 2000 || lp_load < 0 ||
             lp_load > 16 || (tx == 255 && lp_load != 0)) return 1;
         tx_ch = (uint8_t)tx; rx_ch = (uint8_t)rx;
+    } else if (strcmp(cmd, "send") == 0) {
+        int i;
+        /* 通道是必填的第一个参数：send <ch> <id> [b0..b7] */
+        if (argc < 4) {
+            printf("!! send 需要指定通道：send <通道 0..%u> <id> [b0..b7]\n"
+                   "   例：send 2 0x123 11 22 33 44 55 66 77 88\n"
+                   "   发多帧：ECAT2CAN_SEND_COUNT=10 send 2 0x123 11 22\n",
+                   ECAT2CAN_CAN_CHANNEL_MAX);
+            return 1;
+        }
+        {
+            unsigned v = (unsigned)strtoul(argv[3], NULL, 0);
+            if (v > ECAT2CAN_CAN_CHANNEL_MAX) {
+                printf("!! 通道号 %u 超出范围 0..%u\n", v, ECAT2CAN_CAN_CHANNEL_MAX);
+                return 1;
+            }
+            g_can_channel = (uint8_t)v;
+        }
+        if (argc >= 5) {
+            id = (uint32_t)strtoul(argv[4], NULL, 0) & ECAT2CAN_STD_ID_MAX;
+        }
+        len = 0;
+        for (i = 5; i < argc && len < 8; i++, len++) {
+            data[len] = (uint8_t)strtoul(argv[i], NULL, 16);
+        }
+        if (len == 0) len = 8;
+        cycles = 1;
+        {
+            const char *e = getenv("ECAT2CAN_SEND_COUNT");
+            if (e != NULL && *e != '\0') {
+                int v = atoi(e);
+                if (v >= 1 && v <= 1000000) {
+                    cycles = v;
+                } else {
+                    printf("!! ECAT2CAN_SEND_COUNT=%s 超出 1..1000000，按 1 帧处理\n", e);
+                }
+            }
+        }
     } else if (strcmp(cmd, "work") == 0) {
         int i;
         /* 通道是必填的第一个参数：work <ch> <id> [b0..b7] */
@@ -2212,6 +2367,8 @@ int main(int argc, char *argv[])
             rc = cmd_looplat_multi(&fb, lp2_slaves, lp2_nslave, tx_ch, rx_ch,
                                    cycles, lp_freq, lp_load);
         }
+    } else if (strcmp(cmd, "send") == 0) {
+        rc = cmd_send(&fb, g_can_channel, id, data, len, cycles);
     } else if (strcmp(cmd, "work") == 0) {
         rc = cmd_work(&fb, g_can_channel, id, data, len, cycles);
     } else if (strcmp(cmd, "workall") == 0) {

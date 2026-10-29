@@ -233,11 +233,46 @@ int fb_start(fieldbus_t *fb)
     ecx_configdc(ctx);
 
     printf("等待 SAFE-OP ... ");
-    ecx_statecheck(ctx, 0, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE * 4);
+    /*
+     * ★ 重试若干次，而不是一次 ecx_statecheck 定生死。
+     *
+     * 实测：ecx_statecheck() 返回时 slavelist 里的 state 有时还没更新到最新
+     * （从站其实已经到了 SAFE-OP，但本地结构体还是旧的 PRE-OP），紧接着
+     * 调用 ecx_readstate() 才能看到真实的 0x04。原来只有一次判断，于是把
+     * 「已经正常起来」的从站误判成"未进入 SAFE-OP"直接放弃。
+     *
+     * 现在：statecheck 之后补一次 readstate 确认；仍不满足就再等一小会儿
+     * 重来，最多 10 轮（每轮约 EC_TIMEOUTSTATE/10）。
+     */
+    {
+        int attempt;
+        for (attempt = 0; attempt < 10; attempt++) {
+            ecx_statecheck(ctx, 0, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE / 10);
+            if (slave->state == EC_STATE_SAFE_OP) break;
+            ecx_readstate(ctx);              /* 拉一次真实状态 */
+            if (slave->state == EC_STATE_SAFE_OP) break;
+            fb_roundtrip(fb);                /* 让从站再拿到一拍有效输出 */
+            osal_usleep(1000);
+        }
+    }
     printf("完成（当前 0x%02X）\n", slave->state);
     if (slave->state != EC_STATE_SAFE_OP) {
+        int k;
         printf("!! 从站未进入 SAFE-OP，停止启动并清理现场总线\n");
+        /*
+         * ★ 关键诊断：把每个从站的 AL_STATUS 和 AL_STATUS_CODE 打出来。
+         *   PRE-OP → SAFE-OP 失败几乎都是 SM / FMMU 配置问题，具体是哪一条
+         *   由 AL_STATUS_CODE 指明（例如 0x0016 邮箱配置、0x001D/0x001E 输入
+         *   输出配置、0x0024 FMMU 配置）。原来这里只调了 ecx_readstate()
+         *   却什么都不打印，等于把最有用的信息扔掉了。
+         */
         ecx_readstate(ctx);
+        for (k = 1; k <= ctx->slavecount; k++) {
+            ec_slavet *s = ctx->slavelist + k;
+            printf("   从站 %d: state=0x%04X  AL_CODE=0x%04X  (%s)\n",
+                   k, s->state, (unsigned)s->ALstatuscode,
+                   (char *)ec_ALstatuscode2string((uint16_t)s->ALstatuscode));
+        }
         fb_release(fb);
         return 0;
     }

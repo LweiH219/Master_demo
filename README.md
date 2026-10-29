@@ -61,7 +61,13 @@ build/ecat2can_master <网卡> loop 1000
 # 扫描四路 CAN 反馈
 build/ecat2can_master <网卡> scan 3000
 
-# 指定通道发送一帧
+# 指定通道发送单帧（逐帧打印往返 / WKC / 从站状态）
+build/ecat2can_master <网卡> send 0 0x123 11 22 33 44 55 66 77 88
+
+# 连发多帧（单帧太快，candump 和指示灯都难捕捉，连发才看得清）
+ECAT2CAN_SEND_COUNT=100 build/ecat2can_master <网卡> send 0 0x123 11 22
+
+# 压测：连续 2000 帧（约 2 秒）
 build/ecat2can_master <网卡> work 0 0x123 11 22 33 44 55 66 77 88
 
 # 查看反馈
@@ -77,16 +83,16 @@ build/motor_pos --help
 
 ## 文档导航
 
-| 需求 | 文档 |
-| --- | --- |
-| 浏览完整文档分类 | [`docs/README.md`](docs/README.md) |
-| 快速查命令和推荐测试顺序 | [`docs/guide/COMMANDS.md`](docs/guide/COMMANDS.md) |
-| 理解目录、依赖和测试分层 | [`docs/design/ARCHITECTURE.md`](docs/design/ARCHITECTURE.md) |
-| `looplat`、`rt`、`probe` 和指标解读 | [`docs/guide/RT_GUIDE.md`](docs/guide/RT_GUIDE.md) |
-| DJI `motor_pos` 使用和安全机制 | [`docs/guide/MOTOR_EXAMPLE.md`](docs/guide/MOTOR_EXAMPLE.md) |
-| SocketCAN 链路自测 | [`docs/guide/CAN_LINKTEST.md`](docs/guide/CAN_LINKTEST.md) |
-| 常见故障、寄存器和排查顺序 | [`docs/guide/TROUBLESHOOTING.md`](docs/guide/TROUBLESHOOTING.md) |
-| 主机基准测试档案 | [`benchmarks/`](benchmarks/) |
-| 实测结论和历史报告 | [`docs/reports/`](docs/reports/) |
+| 需求                                      | 文档                                                              |
+| ----------------------------------------- | ----------------------------------------------------------------- |
+| 浏览完整文档分类                          | [`docs/README.md`](docs/README.md)                               |
+| 快速查命令和推荐测试顺序                  | [`docs/guide/COMMANDS.md`](docs/guide/COMMANDS.md)               |
+| 理解目录、依赖和测试分层                  | [`docs/design/ARCHITECTURE.md`](docs/design/ARCHITECTURE.md)     |
+| `looplat`、`rt`、`probe` 和指标解读 | [`docs/guide/RT_GUIDE.md`](docs/guide/RT_GUIDE.md)               |
+| DJI `motor_pos` 使用和安全机制          | [`docs/guide/MOTOR_EXAMPLE.md`](docs/guide/MOTOR_EXAMPLE.md)     |
+| SocketCAN 链路自测                        | [`docs/guide/CAN_LINKTEST.md`](docs/guide/CAN_LINKTEST.md)       |
+| 常见故障、寄存器和排查顺序                | [`docs/guide/TROUBLESHOOTING.md`](docs/guide/TROUBLESHOOTING.md) |
+| 主机基准测试档案                          | [`benchmarks/`](benchmarks/)                                     |
+| 实测结论和历史报告                        | [`docs/reports/`](docs/reports/)                                 |
 
 建议按“`info` → `loop` → `scan` → `fdb` → `work` → 实时性 → `motor_pos`”顺序定位问题，先确认从站和 CAN 转发，再测试具体设备。
