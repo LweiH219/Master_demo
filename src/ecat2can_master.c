@@ -97,6 +97,31 @@ static void dump_input_pdo(const uint8_t *in)
     }
 }
 
+/* 读取整型环境变量并做范围校验。
+ *
+ * SEND_COUNT / WORK_CYCLES / SEND_INTERVAL_MS 这类参数都遵循同一条规则：
+ *   - 没设置（或空串）→ 用默认值，静默；
+ *   - 越界/不是合法整数 → 打印一行提示，退回默认值（绝不静默截断）。
+ * 逻辑集中在这里，避免每个命令各写一套、边界行为慢慢漂移。 */
+static int env_int(const char *name, int def, int lo, int hi)
+{
+    const char *e = getenv(name);
+    char *end;
+    long v;
+
+    if (e == NULL || *e == '\0') {
+        return def;
+    }
+    errno = 0;
+    v = strtol(e, &end, 10);
+    if (errno != 0 || end == e || *end != '\0' || v < lo || v > hi) {
+        printf("!! %s=%s 不是 %d..%d 内的整数，改用默认值 %d\n",
+               name, e, lo, hi, def);
+        return def;
+    }
+    return (int)v;
+}
+
 /* ===================== 各命令 ===================== */
 /*
  * 读**枚举到的从站**的 ESC 寄存器。
@@ -144,17 +169,29 @@ static int cmd_regs(fieldbus_t *fb)
     return 0;
 }
 
+/* info 的停滞判据：连续这么多拍上行 seq 没有变化，就认为从站应用层停住了。
+ * 1 kHz 下约 100 ms —— 比"人眼觉得卡"短得多，又能容忍启动阶段的抖动。 */
+#define INFO_STALL_CYCLES 100
+
 static int cmd_info(fieldbus_t *fb)
 {
     int disp_tick = 0;
     int tick = 0;
     ec_groupt *grp0 = fb->ctx.grouplist + 0;
     ecat2can_tx_rx_message *out = FB_OUT(fb, grp0);
+    const ecat2can_tx_rx_message *in = FB_IN(fb, grp0);
+    int last_in_seq = -1;   /* 上一拍有效上行的 seq（-1 = 还没有有效上行）*/
+    int stall = 0;          /* 连续多少拍上行 seq 没变 */
+    int stalled = 0;        /* 是否已报过停滞：只在"进入/恢复"时各提示一次 */
+    int tty = isatty(STDOUT_FILENO);
 
     while (!g_stop) {
         ec_groupt *grp = fb->ctx.grouplist + 0;
         int expected_wkc = grp->outputsWKC * 2 + grp->inputsWKC;
         int wkc;
+        char mark[32];
+
+        mark[0] = '\0';
 
         /*
          * ★ 每轮下发 WORK_MODE 且 frame_count = 0。
@@ -178,6 +215,47 @@ static int cmd_info(fieldbus_t *fb)
         if (++tick % 20 == 0) {
             ecx_readstate(&fb->ctx);
         }
+
+        /* ------------------ 从站应用层停滞检测 ------------------
+         * 从站会把收到的 command/seq 原样回显到上行 PDO（固件
+         * ecat2can_master2slave() 里 "Echo command and seq"）。所以只要从站的
+         * 应用循环还在跑，上行 seq 就会跟着主站下发的 seq 逐拍变化。
+         * 连续 INFO_STALL_CYCLES 拍都不变 → 从站没有在处理过程数据。
+         *
+         * 这个判据不依赖"seq 是回显还是从站自己计数"：两种情况只要从站活着，
+         * 上行 seq 都会变；卡死时都会停。成本只是每拍一次比较。
+         *
+         * ★ 只在上行完整（WKC 满）时判断。WKC 不满时 in 里是旧数据，
+         *   把 EtherCAT 丢帧误报成"应用层停滞"会掩盖真正的故障。 */
+        if (wkc >= expected_wkc) {
+            if (last_in_seq == (int)in->seq) {
+                stall++;
+            } else {
+                if (stalled) {
+                    printf("\n✅ 从站应用层已恢复：上行 seq 重新开始变化\n\n");
+                    stalled = 0;
+                }
+                stall = 0;
+            }
+            last_in_seq = (int)in->seq;
+
+            if (stall >= INFO_STALL_CYCLES && !stalled) {
+                printf("\n⚠️  从站应用层疑似停滞：连续 %d 拍上行 seq 没有变化"
+                       "（卡在 0x%02X，约 %d ms）\n"
+                       "    主站仍在正常下发 WORK_MODE。常见原因：\n"
+                       "    - 从站应用/固件卡死，PDI 中断不再运行\n"
+                       "    - 从站已掉出 OP，ESC 仍在回放旧的上行数据"
+                       "（对照上面的 状态/WKC）\n"
+                       "    从站恢复后这里会自动提示。\n\n",
+                       stall, in->seq, stall);
+                stalled = 1;
+            }
+        } else {
+            /* 上行无效：停滞判据暂停，等 WKC 恢复后重新累计 */
+            stall = 0;
+            last_in_seq = -1;
+        }
+
         /*
          * ★ 过程数据必须以 ~1 kHz 持续下发，不能几十毫秒才发一次。
          *
@@ -190,12 +268,22 @@ static int cmd_info(fieldbus_t *fb)
          */
         if (++disp_tick % 100 == 0) {
             ec_slavet *sl = &fb->ctx.slavelist[fb->slave_idx];
-            printf("往返 %3d us  WKC %d/%d  状态 0x%02X%s  AL=0x%04X %-28s\r",
+            if (stalled) {
+                snprintf(mark, sizeof(mark), "  ⚠️ 上行停滞");
+            }
+            /*
+             * 终端里单行原地刷新（\r + 清到行尾）；重定向到文件时改成
+             * 一行一条 —— 否则整份日志会被 \r 连成一行，事后根本没法看。
+             * 这与 looplat 的显示策略一致（HANDOFF 7.6）。
+             */
+            printf("往返 %3d us  WKC %d/%d  状态 0x%02X%s  AL=0x%04X %-28s%s%s",
                    fb->roundtrip_us, wkc, expected_wkc,
                    sl->state,
                    (sl->state == EC_STATE_OPERATIONAL) ? " (OP)" : "",
                    sl->ALstatuscode,
-                   ec_ALstatuscode2string(sl->ALstatuscode));
+                   ec_ALstatuscode2string(sl->ALstatuscode),
+                   mark,
+                   tty ? "\x1b[K\r" : "\n");
             fflush(stdout);
         }
         osal_usleep(1000);
@@ -248,21 +336,22 @@ static int cmd_loop(fieldbus_t *fb, int cycles)
         /*
          * 本轮的上行应该等于上一轮的下行（第 0 轮没有上一轮，跳过）。
          *
-         * ★ 但要跳过 5 字节协议头里【从站自己拥有】的字段：
-         *     offset 2 = seq          从站自己的发送序号，逐帧递增
+         * ★ 但保守跳过 5 字节协议头里的 offset 2/3/4：
+         *     offset 2 = seq          不同固件版本行为不一致（有的原样回填，
+         *                             有的换成自己的计数）
          *     offset 3 = status       从站反馈状态
          *     offset 4 = error_flags  从站反馈错误标志
          *   command / frame_count 是主站下发的，从站原样保留 → 要参与比对。
          *
-         * 早先这里 memcmp 整个 192 字节，把从站的 seq 和主站下发的 seq 对比，
-         * 两者本来就不同源，于是偶发差 1 就误报「不一致」——
-         * 实测每 150 轮左右误报一次。
+         * 当前从站源码（application/ecat2can.c）的 LOOP_TEST 分支实际是
+         * 整段回填；但历史固件改写过这三个字节（早先 memcmp 整段曾每 150
+         * 轮左右误报一次），保留跳过是对固件版本更稳的做法。
          */
         if (round > 0) {
             int diff = 0, first = -1;
             compared++;
             for (i = 0; i < (int)ECAT2CAN_PDO_BYTES; i++) {
-                if (i == 2 || i == 3 || i == 4) continue;   /* 从站拥有的字段 */
+                if (i == 2 || i == 3 || i == 4) continue;   /* 固件行为不一致的字段 */
                 if (prev[i] != in[i]) { diff = 1; first = i; break; }
             }
             if (diff) {
@@ -319,7 +408,12 @@ static int work_channels(fieldbus_t *fb, const uint8_t *chs, int nch,
     ec_groupt *grp = fb->ctx.grouplist + 0;
     ecat2can_tx_rx_message *out = FB_OUT(fb, grp);
     const ecat2can_tx_rx_message *in = FB_IN(fb, grp);
+    int expected_wkc = grp->outputsWKC * 2 + grp->inputsWKC;
     int i, k, round, last_count = -1;
+    int wkc_bad = 0;                  /* 过程数据没回来：这拍上行不可用 */
+    int echo_checked = 0, echo_bad = 0;
+    int prev_valid = 0;
+    uint8_t prev_seq = 0;
     unsigned base_seq;
     struct timespec ts;
 
@@ -345,15 +439,47 @@ static int work_channels(fieldbus_t *fb, const uint8_t *chs, int nch,
            "        MCAN 会不断重发直到进入 bus-off（固件已带自动恢复，但那一拍会丢帧）。\n");
 
     for (round = 0; round < cycles && !g_stop; round++) {
+        int wkc;
+        uint8_t out_seq = (uint8_t)(base_seq + (unsigned)round);
+
         memset(out, 0, ECAT2CAN_PDO_BYTES);
         out->command = WORK_MODE;
         out->frame_count = (uint8_t)nch;
-        out->seq = (uint8_t)(base_seq + (unsigned)round);
+        out->seq = out_seq;
         for (k = 0; k < nch; k++) {
             build_frame(out, k, chs[k], id, data, len);
         }
 
-        fb_roundtrip(fb);
+        wkc = fb_roundtrip(fb);
+
+        /* ★ 先判 WKC 再读 in：上行没完整回来时 in 是旧数据（HANDOFF 6.6） */
+        if (wkc < expected_wkc) {
+            wkc_bad++;
+            /* 只打前几次：真故障时可能连续几百拍都失败，逐拍打印会刷屏 */
+            if (wkc_bad <= 5) {
+                printf("第 %4d 轮  往返 %d us  WKC %d/%d  "
+                       "← 过程数据不完整，本拍上行不可用\n",
+                       round, fb->roundtrip_us, wkc, expected_wkc);
+            }
+            prev_valid = 0;
+            osal_usleep(1000);
+            continue;
+        }
+
+        /* seq/command 回显校验：本拍上行对应上一拍下发（理由见 cmd_send）*/
+        if (prev_valid) {
+            echo_checked++;
+            if (in->seq != prev_seq || in->command != WORK_MODE) {
+                echo_bad++;
+                if (echo_bad <= 3) {
+                    printf("  ⚠ 上行回显不一致：本拍 seq=0x%02X command=0x%02X，"
+                           "期望（上一拍下发）seq=0x%02X command=0x%02X\n",
+                           in->seq, in->command, prev_seq, WORK_MODE);
+                }
+            }
+        }
+        prev_seq = out_seq;
+        prev_valid = 1;
 
         if (round < 5 || in->frame_count != last_count ||
             in->status != ECAT2CAN_STATUS_OK || in->error_flags != 0) {
@@ -362,6 +488,21 @@ static int work_channels(fieldbus_t *fb, const uint8_t *chs, int nch,
             last_count = in->frame_count;
         }
         osal_usleep(1000);
+    }
+
+    /* 压测结束再给一次汇总，否则前面只打印前几轮/变化轮，异常容易被刷掉 */
+    if (wkc_bad > 0) {
+        printf("!! %d/%d 拍过程数据不完整（WKC 未满），这些拍的上行没有参与回显校验\n",
+               wkc_bad, cycles);
+    }
+    if (echo_checked > 0) {
+        if (echo_bad == 0) {
+            printf("seq 回显校验：%d 拍全部与上一拍下发一致 ✅（PDO 对齐正常）\n",
+                   echo_checked);
+        } else {
+            printf("seq 回显校验：%d/%d 拍不一致 ⚠️（老固件可能不回显 seq；"
+                   "否则查 PDO 映射/主从周期）\n", echo_bad, echo_checked);
+        }
     }
     return 0;
 }
@@ -376,21 +517,27 @@ static int cmd_work(fieldbus_t *fb, uint8_t ch, uint32_t id,
  * 单帧/小批量发送：send <通道> <id> [b0..b7]
  *
  * 和 work 的区别：
- *   work  固定 2000 轮（2 秒），只在前几轮打印，用来压测
+ *   work  默认 2000 轮（2 秒），只在前几轮打印，用来压测
  *   send  默认只发 1 帧，而且每帧都打印往返时间 / WKC / 从站状态 / 回传帧数，
  *         适合"我就要发这一帧，看清楚它到底发生了什么"的场合。
  *
  * 帧数用环境变量控制，避免和 8 个数据字节抢参数位置：
  *   ECAT2CAN_SEND_COUNT=10 send 2 0x123 11 22
+ * 帧间隔同样用环境变量控制（低速周期发送用）：
+ *   ECAT2CAN_SEND_INTERVAL_MS=10 send 2 0x123 11 22
  */
 static int cmd_send(fieldbus_t *fb, uint8_t ch, uint32_t id,
-                    const uint8_t *data, int len, int count)
+                    const uint8_t *data, int len, int count, int interval_ms)
 {
     ec_groupt *grp = fb->ctx.grouplist + 0;
     ecat2can_tx_rx_message *out = FB_OUT(fb, grp);
     const ecat2can_tx_rx_message *in = FB_IN(fb, grp);
     int expected_wkc = grp->outputsWKC * 2 + grp->inputsWKC;
     int i, round, ok = 0, echoes = 0;
+    int wkc_bad = 0;                  /* 过程数据没回来：这拍上行不可用 */
+    int echo_checked = 0, echo_bad = 0;
+    int prev_valid = 0;
+    uint8_t prev_seq = 0;
     unsigned base_seq;
     struct timespec ts;
 
@@ -414,22 +561,64 @@ static int cmd_send(fieldbus_t *fb, uint8_t ch, uint32_t id,
     for (i = 0; i < len && i < 8; i++) {
         printf(" %02X", data[i]);
     }
-    printf("  共 %d 帧\n", count);
+    printf("  共 %d 帧，间隔 %d ms\n", count, interval_ms);
 
     for (round = 0; round < count && !g_stop; round++) {
         int wkc;
+        uint8_t out_seq = (uint8_t)(base_seq + (unsigned)round);
 
         memset(out, 0, ECAT2CAN_PDO_BYTES);
         out->command = WORK_MODE;
         out->frame_count = 1u;
-        out->seq = (uint8_t)(base_seq + (unsigned)round);
+        out->seq = out_seq;
         build_frame(out, 0, ch, id, data, len);
 
         wkc = fb_roundtrip(fb);
 
-        if (wkc == expected_wkc) {
-            ok++;
+        /*
+         * ★ 先判 WKC，再读 in（HANDOFF 6.6 的硬规则）。
+         *
+         * fb_roundtrip() 返回工作计数器；小于期望值说明这一拍的过程数据
+         * 没有完整回来，in 里还是上一拍的旧内容。直接读它会打印出
+         * "本拍从 CAN 收到 N 帧"这种假结论，也会污染后面的回显校验。
+         */
+        if (wkc < expected_wkc) {
+            wkc_bad++;
+            printf("  第 %3d 帧  往返 %3d us  WKC %d/%d  "
+                   "← 过程数据不完整，本拍上行不可用\n",
+                   round + 1, fb->roundtrip_us, wkc, expected_wkc);
+            prev_valid = 0;
+            fflush(stdout);
+            if (interval_ms > 0) {
+                osal_usleep((unsigned)interval_ms * 1000u);
+            }
+            continue;
         }
+
+        ok++;
+
+        /*
+         * seq/command 回显校验。
+         *
+         * 从站把收到的 command+seq 原样回显到上行 PDO（固件
+         * ecat2can_master2slave()）。EtherCAT 一帧里 ESC 是先取上行数据、
+         * 再把下行写进 SM2，所以【本拍读到的上行】对应【上一拍下发的输出】。
+         * 两者不一致 → 主从不在同一个逻辑周期，或 PDO 映射错位。
+         */
+        if (prev_valid) {
+            echo_checked++;
+            if (in->seq != prev_seq || in->command != WORK_MODE) {
+                echo_bad++;
+                if (echo_bad <= 3) {
+                    printf("  ⚠ 上行回显不一致：本拍 seq=0x%02X command=0x%02X，"
+                           "期望（上一拍下发）seq=0x%02X command=0x%02X\n",
+                           in->seq, in->command, prev_seq, WORK_MODE);
+                }
+            }
+        }
+        prev_seq = out_seq;
+        prev_valid = 1;
+
         echoes += in->frame_count;
 
         printf("  第 %3d 帧  往返 %3d us  WKC %d/%d  从站状态 0x%02X  "
@@ -438,11 +627,28 @@ static int cmd_send(fieldbus_t *fb, uint8_t ch, uint32_t id,
                in->status, in->frame_count);
         fflush(stdout);
 
-        osal_usleep(1000);
+        if (interval_ms > 0) {
+            osal_usleep((unsigned)interval_ms * 1000u);
+        }
     }
 
     printf("完成：%d/%d 帧 WKC 正常（从站在这些拍里共收到 %d 帧 CAN 报文）\n",
            ok, count, echoes);
+    if (wkc_bad > 0) {
+        printf("  过程数据不完整：%d/%d 帧 WKC 未满，这些帧不参与回显校验\n",
+               wkc_bad, count);
+    }
+    if (echo_checked > 0) {
+        if (echo_bad == 0) {
+            printf("  seq 回显校验：%d 拍全部与上一拍下发一致 ✅（PDO 对齐正常）\n",
+                   echo_checked);
+        } else {
+            printf("  seq 回显校验：%d/%d 拍不一致 ⚠️\n"
+                   "    老版本从站固件可能不回显 seq，属正常现象；\n"
+                   "    否则通常是主从不在同一逻辑周期，或上下行 PDO 映射错位。\n",
+                   echo_bad, echo_checked);
+        }
+    }
 
     /*
      * 单帧很容易"看起来没发出去"：一帧标准帧在 1 Mbps 总线上只占约 130 us，
@@ -485,6 +691,8 @@ static int cmd_scan(fieldbus_t *fb, int cycles)
     uint16_t ids[ECAT2CAN_CAN_CHANNEL_COUNT][SCAN_MAX_IDS];
     int nids[ECAT2CAN_CAN_CHANNEL_COUNT];
     int round, k, n;
+    int expected_wkc = grp->outputsWKC * 2 + grp->inputsWKC;
+    int wkc_bad = 0;
 
     memset(cnt, 0, sizeof(cnt));
     memset(nids, 0, sizeof(nids));
@@ -493,11 +701,24 @@ static int cmd_scan(fieldbus_t *fb, int cycles)
     printf("      （从站四路全开，插在哪个座子上就统计到哪个通道）\n\n");
 
     for (round = 0; round < cycles && !g_stop; round++) {
+        int wkc;
+
         memset(out, 0, ECAT2CAN_PDO_BYTES);
         out->command = ONLY_FDB;
         out->seq = (uint8_t)round;
 
-        fb_roundtrip(fb);
+        wkc = fb_roundtrip(fb);
+
+        /* ★ 先判 WKC 再读 in：上行不完整时 in 是旧数据，计进统计会造假 */
+        if (wkc < expected_wkc) {
+            wkc_bad++;
+            if (wkc_bad <= 5) {
+                printf("  第 %d 拍 WKC %d/%d，过程数据不完整，本拍不计入统计\n",
+                       round, wkc, expected_wkc);
+            }
+            osal_usleep(1000);
+            continue;
+        }
 
         n = (int)in->frame_count;
         if (n > (int)ECAT2CAN_MAX_FRAME_COUNT) n = (int)ECAT2CAN_MAX_FRAME_COUNT;
@@ -551,6 +772,10 @@ static int cmd_scan(fieldbus_t *fb, int cycles)
         } else {
             printf("\n  合计 %u 帧。出现帧的通道说明该路收发链路正常。\n", total);
         }
+    }
+    if (wkc_bad > 0) {
+        printf("\n  ⚠ %d/%d 拍 WKC 未满（过程数据不完整），这些拍的上行没有计入统计。\n",
+               wkc_bad, cycles);
     }
     return 0;
 }
@@ -1698,6 +1923,7 @@ static int cmd_canloop(fieldbus_t *fb, int tx_slave, uint8_t tx_ch,
                        int seconds, int freq_hz)
 {
     ec_groupt *grp = fb->ctx.grouplist + 0;
+    int expected_wkc = grp->outputsWKC * 2 + grp->inputsWKC;
     struct timespec cl_send[CL_WIN];
     unsigned char cl_valid[CL_WIN];
     uint32_t *lat;
@@ -1768,7 +1994,7 @@ static int cmd_canloop(fieldbus_t *fb, int tx_slave, uint8_t tx_ch,
         clock_gettime(CLOCK_MONOTONIC, &cl_send[i % CL_WIN]);
         cl_valid[i % CL_WIN] = 1;
 
-        if (fb_roundtrip(fb) < 0) { ecat_to++; tick_sleep(&next, period_us); continue; }
+        if (fb_roundtrip(fb) < expected_wkc) { ecat_to++; tick_sleep(&next, period_us); continue; }
 
         /*
          * ★ 循环轮询，而不是只读一次。
@@ -1809,14 +2035,23 @@ static int cmd_canloop(fieldbus_t *fb, int tx_slave, uint8_t tx_ch,
                     o2->seq = (uint8_t)i;
                 }
 
-                if (fb_roundtrip(fb) < 0) { ecat_to++; break; }
+                if (fb_roundtrip(fb) < expected_wkc) { ecat_to++; break; }
 
                 {
                     const ecat2can_tx_rx_message *in = FB_IN_N(fb, grp, rx_slave);
                     int nfr = (int)in->frame_count;
+                    int j;
+
                     if (nfr > (int)ECAT2CAN_MAX_FRAME_COUNT) nfr = (int)ECAT2CAN_MAX_FRAME_COUNT;
-                    for (k = 0; k < nfr; k++) {
-                        const can_frame_struct *f = &in->can_frames[k];
+                    /*
+                     * ★ 内层循环变量必须独立。
+                     *   这里原来复用了外层轮询计数 k：内层跑完后 k 变成
+                     *   帧数，外层再 ++ 就会跳过多轮轮询。CAN 反馈帧一多
+                     *   （每拍最多 17 帧）轮询次数会被吃掉大半，回声可能
+                     *   在轮询窗口内等不到 —— 表现为"跨从站回环延迟偏高/丢帧"。
+                     */
+                    for (j = 0; j < nfr; j++) {
+                        const can_frame_struct *f = &in->can_frames[j];
                         int sent_seq, slot;
                         if (f->can_channel != rx_ch || f->std_id != 0x200) continue;
                         if (f->data[2] != 0xC3 || f->data[3] != 0x3C) continue;
@@ -1920,16 +2155,31 @@ static int cmd_fdb(fieldbus_t *fb, int cycles)
     ec_groupt *grp = fb->ctx.grouplist + 0;
     ecat2can_tx_rx_message *out = FB_OUT(fb, grp);
     const ecat2can_tx_rx_message *in = FB_IN(fb, grp);
-    int round, last_count = -1;
+    int expected_wkc = grp->outputsWKC * 2 + grp->inputsWKC;
+    int round, last_count = -1, wkc_bad = 0;
 
     printf("ONLY_FDB：只收 CAN 总线反馈，不下发（%d 次）\n", cycles);
 
     for (round = 0; round < cycles && !g_stop; round++) {
+        int wkc;
+
         memset(out, 0, ECAT2CAN_PDO_BYTES);
         out->command = ONLY_FDB;
         out->seq = (uint8_t)round;
 
-        fb_roundtrip(fb);
+        wkc = fb_roundtrip(fb);
+
+        /* ★ 先判 WKC 再读 in：上行不完整时 in 是旧数据（HANDOFF 6.6）*/
+        if (wkc < expected_wkc) {
+            wkc_bad++;
+            if (wkc_bad <= 5) {
+                printf("第 %4d 轮  往返 %d us  WKC %d/%d  "
+                       "← 过程数据不完整，本拍反馈不可用\n",
+                       round, fb->roundtrip_us, wkc, expected_wkc);
+            }
+            osal_usleep(1000);
+            continue;
+        }
 
         if (round < 5 || in->frame_count != last_count) {
             printf("第 %4d 轮  往返 %d us\n", round, fb->roundtrip_us);
@@ -1937,6 +2187,10 @@ static int cmd_fdb(fieldbus_t *fb, int cycles)
             last_count = in->frame_count;
         }
         osal_usleep(1000);
+    }
+    if (wkc_bad > 0) {
+        printf("!! %d/%d 拍 WKC 未满（过程数据不完整），这些拍没有打印反馈\n",
+               wkc_bad, cycles);
     }
     return 0;
 }
@@ -1967,15 +2221,16 @@ static int cmd_reset(fieldbus_t *fb)
 static void usage(const char *prog)
 {
     printf("用法: %s <网卡名> <命令> [参数...]\n"
+           "      %s --help              显示本帮助并退出\n"
            "\n"
            "  regs                    ★读 ESC 寄存器（DL_STAT / STATION_ADDR）判断链路与身份\n"
            "  probe <sec> <tx|ecat> <rx> [Hz] [load]  CSV absolute deadline/RTT probe (ID 0x600)\n"
-           "  info                    进 OP，打印从站信息并周期刷新（Ctrl+C 退出）\n"
+           "  info                    进 OP 周期刷新状态；上行 seq 连续 100 拍不变会告警（Ctrl+C 退出）\n"
            "  loop [次数]             LOOP_TEST，192 字节往返一致性校验（默认 1000）\n"
            "  scan [次数]             ★多通道扫描：只看不发，统计各路收帧数与出现过的 ID\n"
-           "  send <通道> <id> [b0..b7]  ★发 1 帧并逐帧打印往返/WKC/状态/收到帧数\n"
-           "                         帧数用 ECAT2CAN_SEND_COUNT=N 控制（默认 1）\n"
-           "  work <通道> <id> [b0..b7]  WORK_MODE，固定 2000 拍（1 kHz）压测\n"
+           "  send <通道> <id> [b0..b7]  ★发 1 帧并逐帧打印往返/WKC/状态/收到帧数，\n"
+           "                         并校验上行 seq/command 是否等于上一拍下发（PDO 对齐自证）\n"
+           "  work <通道> <id> [b0..b7]  WORK_MODE 压测（默认 2000 拍 @ 1 kHz）\n"
            "  workall <id> [b0..b7]   ★在 4 个通道各发一帧（同一拍 PDO）\n"
            "  bench [次数] [通道]     ★性能基准：EtherCAT 往返 / 循环抖动 / CAN 吞吐\n"
            "  rt [秒数] [通道|host]   ★实时性合格性测试：直方图 / 截止期错失 / 环境诊断\n"
@@ -1993,23 +2248,33 @@ static void usage(const char *prog)
            "                         ★跨从站 CAN 回环（A 站发、B 站收）\n"
            "  fdb  [次数]             ONLY_FDB，只读 CAN 反馈（默认 20）\n"
            "  reset                   HW_RESET，让从站复位\n"
+           "\n",
+           prog, prog);
+
+    printf("  环境变量:\n"
+           "    ECAT2CAN_SEND_COUNT=N        send 发帧数（默认 1，1..1000000）\n"
+           "    ECAT2CAN_SEND_INTERVAL_MS=N  send 帧间隔毫秒（默认 1；0=不等待，最大 90）\n"
+           "    ECAT2CAN_WORK_CYCLES=N       work/workall 拍数（默认 2000，1..1000000）\n"
+           "    ECAT2CAN_SLAVE=N             操作第 N 个从站（默认 1）\n"
+           "    ECAT2CAN_CH=N                默认 CAN 通道（默认 3）\n"
+           "    ECAT2CAN_SCAN_RETRY=N        启动扫描重试次数（默认 6）\n"
            "\n"
            "  通道号 0~%u，对应从站的 MCAN0~MCAN%u。ECAN-Lite 四个座子分别是\n"
            "  CN4=0 / CN5=1 / CN9=2 / CN1=3；hpm5e3ykit 单路版只有通道 3。\n"
-           "  也可用环境变量 ECAT2CAN_CH 设默认通道。\n"
-           "\n"
-           "示例:\n"
+           "\n",
+           ECAT2CAN_CAN_CHANNEL_MAX, ECAT2CAN_CAN_CHANNEL_MAX);
+
+    printf("示例:\n"
            "  %s enp3s0 scan 3000                        # 先扫一遍，看设备挂在哪一路\n"
            "  %s enp3s0 send 2 0x123 11 22 33 44 55 66 77 88   # 单帧\n"
            "  ECAT2CAN_SEND_COUNT=100 %s enp3s0 send 2 0x123 11 22   # 连发 100 帧\n"
-           "  %s enp3s0 work 0 0x123 11 22 33 44 55 66 77 88\n"
+           "  ECAT2CAN_WORK_CYCLES=500 %s enp3s0 work 0 0x123 11 22  # 只压 500 拍\n"
            "  %s enp3s0 workall 0x1FF 03 E8 00 00 00 00 00 00\n"
            "  %s enp3s0 loop\n"
            "\n"
            "网卡准备:\n"
            "  sudo nmcli dev set <网卡名> managed no\n"
            "  sudo setcap cap_net_raw,cap_net_admin+eip %s\n",
-           prog, ECAT2CAN_CAN_CHANNEL_MAX, ECAT2CAN_CAN_CHANNEL_MAX,
            prog, prog, prog, prog, prog, prog, prog);
 }
 
@@ -2030,8 +2295,15 @@ int main(int argc, char *argv[])
     int cl_tx_slave = 1, cl_rx_slave = 2;
     uint8_t cl_tx_ch = 0, cl_rx_ch = 0;
     int lp_load = 0;
+    int send_interval_ms = 1;   /* send 的帧间隔，ECAT2CAN_SEND_INTERVAL_MS 可改 */
     int len = 8, cycles = -1, rc = 0;
 
+    /* --help / -h：不需要网卡名，退出码 0（否则脚本里 `prog --help` 会误判失败）*/
+    if (argc == 2 &&
+        (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
+        usage(argv[0]);
+        return 0;
+    }
     if (argc < 3) {
         usage(argv[0]);
         return 1;
@@ -2110,18 +2382,13 @@ int main(int argc, char *argv[])
             data[len] = (uint8_t)strtoul(argv[i], NULL, 16);
         }
         if (len == 0) len = 8;
-        cycles = 1;
-        {
-            const char *e = getenv("ECAT2CAN_SEND_COUNT");
-            if (e != NULL && *e != '\0') {
-                int v = atoi(e);
-                if (v >= 1 && v <= 1000000) {
-                    cycles = v;
-                } else {
-                    printf("!! ECAT2CAN_SEND_COUNT=%s 超出 1..1000000，按 1 帧处理\n", e);
-                }
-            }
-        }
+        cycles = env_int("ECAT2CAN_SEND_COUNT", 1, 1, 1000000);
+        /*
+         * 帧间隔：默认 1 ms（1 kHz）。0 = 不等待（能发多快发多快）；
+         * 上限 90 ms —— 从站 SM 看门狗默认 100 ms，间隔再长从站会掉出 OP。
+         * 需要更低速的周期发送时应改用外部脚本/work，而不是拉大这个间隔。
+         */
+        send_interval_ms = env_int("ECAT2CAN_SEND_INTERVAL_MS", 1, 0, 90);
     } else if (strcmp(cmd, "work") == 0) {
         int i;
         /* 通道是必填的第一个参数：work <ch> <id> [b0..b7] */
@@ -2147,7 +2414,7 @@ int main(int argc, char *argv[])
             data[len] = (uint8_t)strtoul(argv[i], NULL, 16);
         }
         if (len == 0) len = 8;
-        cycles = 2000;
+        cycles = env_int("ECAT2CAN_WORK_CYCLES", 2000, 1, 1000000);
     } else if (strcmp(cmd, "workall") == 0) {
         int i;
         if (argc >= 4) {
@@ -2158,12 +2425,12 @@ int main(int argc, char *argv[])
             data[len] = (uint8_t)strtoul(argv[i], NULL, 16);
         }
         if (len == 0) len = 8;
-        cycles = 2000;
+        cycles = env_int("ECAT2CAN_WORK_CYCLES", 2000, 1, 1000000);
     } else if (strcmp(cmd, "scan") == 0) {
         cycles = (argc >= 4) ? atoi(argv[3]) : 3000;
     } else if (strcmp(cmd, "canloop") == 0) {
         /* canloop <发送从站> <发送通道> <接收从站> <接收通道> [秒] [Hz] */
-        int ts, tc, rs, rc;
+        int ts, tc, rs, rch;
         if (argc < 7) {          /* 需要 argv[3..6] 四个参数 */
 
             printf("!! canloop 用法：canloop <发送从站> <发送通道> <接收从站> <接收通道> [秒数=30] [Hz=1000]\n"
@@ -2176,14 +2443,14 @@ int main(int argc, char *argv[])
         ts = atoi(argv[3]);
         tc = atoi(argv[4]);
         rs = atoi(argv[5]);
-        rc = atoi(argv[6]);
+        rch = atoi(argv[6]);
         if (tc < 0 || tc > (int)ECAT2CAN_CAN_CHANNEL_MAX ||
-            rc < 0 || rc > (int)ECAT2CAN_CAN_CHANNEL_MAX) {
+            rch < 0 || rch > (int)ECAT2CAN_CAN_CHANNEL_MAX) {
             printf("!! 通道号必须在 0..%u\n", ECAT2CAN_CAN_CHANNEL_MAX);
             return 1;
         }
         cl_tx_slave = ts; cl_tx_ch = (uint8_t)tc;
-        cl_rx_slave = rs; cl_rx_ch = (uint8_t)rc;
+        cl_rx_slave = rs; cl_rx_ch = (uint8_t)rch;
         cycles  = (argc >= 8) ? atoi(argv[7]) : 30;
         lp_freq = (argc >= 9) ? atoi(argv[8]) : 1000;
         if (lp_freq < 100 || lp_freq > 10000) {
@@ -2376,7 +2643,7 @@ int main(int argc, char *argv[])
                                    cycles, lp_freq, lp_load);
         }
     } else if (strcmp(cmd, "send") == 0) {
-        rc = cmd_send(&fb, g_can_channel, id, data, len, cycles);
+        rc = cmd_send(&fb, g_can_channel, id, data, len, cycles, send_interval_ms);
     } else if (strcmp(cmd, "work") == 0) {
         rc = cmd_work(&fb, g_can_channel, id, data, len, cycles);
     } else if (strcmp(cmd, "workall") == 0) {

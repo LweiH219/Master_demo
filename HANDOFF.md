@@ -59,7 +59,7 @@ sudo nmcli dev set enp3s0 managed no
 
 ```
 src/
-├── ecat2can_master.c   2388 行  ★主程序：所有命令的实现 + main/参数分发
+├── ecat2can_master.c   2663 行  ★主程序：所有命令的实现 + main/参数分发
 ├── ecat2can_fieldbus.c  322 行  ★EtherCAT 会话封装：fb_start/fb_stop/fb_roundtrip
 ├── ecat2can_fieldbus.h   49 行    FB_OUT/FB_IN/FB_OUT_N/FB_IN_N 取 PDO 指针
 ├── ecat2can_proto.h     118 行  ★192 字节 PDO 协议定义（与从站逐位对应）
@@ -94,7 +94,9 @@ make clean              # 删除 build/
 **关键技术点：**
 - **SOEM 内置在 `third_party/SOEM`** —— 整个仓库自包含，拷到任何机器都能构建
 - **`BUILD_DJI_MOTOR_TEST=ON`（默认）** 时额外产出 `motor_pos`
-- **编译器警告开着 `-Wall -Wextra`** —— 别引入新警告
+- **编译器警告开着 `-Wall -Wextra -Wshadow`** —— 别引入新警告。
+  `-Wshadow` 是 2026-11-01 接管维护时加的：它抓到过两处真实变量遮蔽
+  （canloop 轮询计数被内层循环复用、命令参数 `rc` 遮蔽 `main` 的返回码）。
 
 ### 权限（⚠️ 每次重新链接后必须重做）
 
@@ -128,28 +130,39 @@ sudo nmcli dev set enp3s0 managed no
 
 | 命令 | 作用 | 关键输出 |
 |---|---|---|
-| **`info`** | **进 OP 并持续刷新状态（Ctrl+C 退出）** | WKC / AL / 往返 / 状态 |
+| **`info`** | **进 OP 并持续刷新状态（Ctrl+C 退出）** | WKC / AL / 往返 / 状态 / **停滞告警** |
 | **`scan [次数]`** | 只看不发，统计 4 路 CAN 各收到多少帧 | 哪一路有设备 |
 | **`regs`** | 读 ESC 寄存器（DL_STAT / STATION_ADDR） | 链路与身份 |
 | **`reset`** | HW_RESET，让从站复位 | — |
 
-**`info` 的两个实现细节（很重要）：**
+**`info` 的三个实现细节（很重要）：**
 1. **它是无限循环** —— 可以作为"后台 EtherCAT 周期发生器"，
    同时用另一台机器/PCAN 做 CAN 侧观察。
 2. **它每轮下发 `WORK_MODE` + `frame_count=0`** ——
    因为从站只有 WORK_MODE/ONLY_FDB 才读 CAN 接收 FIFO。
-   详见第 7.3 节。
+   详见第 6.3 节。
+3. **从站应用层停滞检测（2026-11-01 新增）** ——
+   上行 seq 连续 100 拍不变即告警（只在上行 WKC 满时判定），
+   从站恢复会自动提示。原理见第 6.7 节。
+   输出在终端里是单行 `\r` 刷新，重定向到文件时自动改成一行一条。
 
 ### 4.2 CAN 发送
 
 | 命令 | 帧数 | 输出 | 用途 |
 |---|---|---|---|
 | **`send <ch> <id> [b0..b7]`** | **默认 1**（`ECAT2CAN_SEND_COUNT=N`）| **逐帧打印** | **精确发一帧/小批量** |
-| **`work <ch> <id> [b0..b7]`** | **固定 2000**（2 秒 @1kHz）| 只前几轮 | 压测 |
-| **`workall <id> [b0..b7]`** | 2000 × 4 通道 | 只前几轮 | 四路并发 |
+| **`work <ch> <id> [b0..b7]`** | **默认 2000**（`ECAT2CAN_WORK_CYCLES=N`）| 只前几轮 | 压测 |
+| **`workall <id> [b0..b7]`** | 默认 2000 × 4 通道（同上可配）| 只前几轮 | 四路并发 |
 
 **`send` 单帧几乎无法用肉眼/`candump` 观察**（一帧只有 ~130 µs），
 **稳定观察请用 `ECAT2CAN_SEND_COUNT=100`。** 程序在 count=1 时会主动提示。
+
+**`send` 的两个 2026-11-01 新增能力：**
+- **帧间隔**：`ECAT2CAN_SEND_INTERVAL_MS=N`（默认 1 ms，0=不等待，最大 90）。
+  上限 90 是因为从站 SM 看门狗默认 100 ms，再慢从站会掉出 OP。
+- **seq/command 回显校验**：count≥2 时每拍校验"本拍上行 seq/command
+  == 上一拍下发的 seq/command"，结束时打印汇总。不一致说明 PDO 错位
+  或主从不在同一逻辑周期。原理见第 6.7 节。
 
 ### 4.3 CAN 接收
 
@@ -190,6 +203,8 @@ sudo nmcli dev set enp3s0 managed no
 | **`ECAT2CAN_SCAN_RETRY`** | 6 | 扫描重试次数（每轮 ~400ms）|
 | **`ECAT2CAN_CH`** | 3 | 默认 CAN 通道 |
 | **`ECAT2CAN_SEND_COUNT`** | 1 | `send` 的发帧数（1~1000000）|
+| **`ECAT2CAN_SEND_INTERVAL_MS`** | 1 | `send` 的帧间隔毫秒（0~90，0=不等待；>90 会撞从站 SM 看门狗）|
+| **`ECAT2CAN_WORK_CYCLES`** | 2000 | `work`/`workall` 的拍数（1~1000000）|
 | **`ECAT2CAN_PROBE_CSV`** | — | `probe` 的 CSV 输出路径 |
 | **`ECAT2CAN_DUMP_LAYOUT`** | — | 打印 PDO 字节布局 |
 
@@ -338,10 +353,49 @@ out->seq = (uint8_t)i;
 
 **现在 `loop` 命令跳过这 3 个字节再比对。**
 
+> **补充（2026-11-01 接管维护时核对源码 + 实机验证）：**
+> 当前从站源码 `application/ecat2can.c` 的 `LOOP_TEST` 分支其实是用
+> `ecat2can_slave2master(&master_msg)` **整段回填**，包括 seq/status/error_flags。
+> 主站仍保留跳过这 3 个字节，是为了兼容可能改写它们的旧固件 ——
+> **这是有意的防御性设计，不是 bug，不要"优化"掉。**
+
 ### 6.6 为什么 `fb_roundtrip()` 后要立刻检查返回值
 
 它返回 WKC。`< 0` 表示过程数据没回来（EtherCAT 帧丢了）。
 **所有测量命令都要先判这个，不能直接读 `in->` 的内容。**
+
+> **2026-11-01 加固：** 单从站命令（`send`/`work`/`scan`/`fdb`）现在用
+> `wkc < expected_wkc`（期望值 = `outputsWKC*2 + inputsWKC`）判断"上行是否可用"，
+> 比只看 `<0` 更严格：部分 WKC 时从站写入的输入可能不完整。
+> `canloop` 也由 `<0` 收紧到期望值。
+
+### 6.7 上行 `seq`/`command` 是"上一拍下发"的回显（新，2026-11-01）
+
+这条规则以前只散落在注释里，现在 `send`/`work` 的校验和 `info` 的停滞检测都依赖它：
+
+```
+固件 ecat2can_master2slave():
+   memcpy(master_msg, OutputCounter0x7010, 192);   // 取本周期输出
+   slave_msg.command = master_msg.command;          // 回显 command
+   slave_msg.seq     = master_msg.seq;              // 回显 seq
+```
+
+EtherCAT 一帧里 ESC 是**先**把 SM3 上行数据塞进帧、**再**把帧里的下行写进 SM2。
+所以主站第 N 拍读到的上行，对应第 N-1 拍写下去的输出：
+
+```
+主站拍 N-1:  写 output { command=WORK_MODE, seq=S }
+主站拍 N  :  读 input  { command=WORK_MODE, seq=S }   ← 正好是上一拍的回显
+```
+
+用途：
+- **`send`/`work` 回显校验**：本拍 `in->seq` 应等于上一拍 `out->seq`、
+  `in->command` 应等于上一拍 `out->command`。不等 → PDO 错位/主从不同周期。
+  实机验证：连续 100 帧 `send` 得到 99/99 全部一致。
+- **`info` 停滞检测**：主站每拍都改 `out->seq`，从站活着就必须回显出变化的
+  `in->seq`；连续 100 拍不变 → 从站应用层卡住。该判据不依赖"seq 是回显还是
+  从站自己计数"，两种情况都成立。
+- 注意：`send` 只发 1 帧（默认）时没有"上一拍"可比，**回显校验从第 2 帧开始**。
 
 ---
 
@@ -381,11 +435,12 @@ TEC 累加到 255 → bus-off。
 **从站固件有自动恢复，但那一拍会丢帧。**
 **测试时必须接一个对端（PCAN 或另一块板）。**
 
-### 7.6 ⚠️ `ncurses`/`\r` 刷新只在终端里启用
+### 7.6 ⚠️ `\r` 刷新只在终端里启用
 
-`show_progress` 用 `isatty(STDOUT_FILENO)` 判断。
-**重定向到文件时不会输出进度行，输出保持干净**（这是刻意的，
-方便前后对比）。
+`looplat` 的 `show_progress` 和 `info` 的状态行都用 `isatty(STDOUT_FILENO)` 判断。
+**终端里**用 `\r` 单行原地刷新（`info` 还会 `\x1b[K` 清行尾）；
+**重定向到文件时** `looplat` 不输出进度行、`info` 改成一行一条 ——
+输出保持干净，方便前后对比和事后读日志。
 
 ### 7.7 ⚠️ setcap 的参数陷阱
 
@@ -470,7 +525,29 @@ p50    528 us（不变）
 
 ## 9. 已知问题与待办
 
-### 9.1 已修复（本次）
+### 9.1 已修复
+
+**2026-11-01 接管维护这一轮（新增）：**
+
+- ✅ **`info` 从站应用层停滞检测** —— 上行 seq 连续 100 拍不变即告警，
+  恢复自动提示（原理见 6.7；只在 WKC 满时判定，避免把 EtherCAT 丢帧误报成停滞）
+- ✅ **`send`/`work`/`workall` seq/command 回显校验** —— 结束时汇总；
+  实机 100 帧 `send` 得到 99/99 一致
+- ✅ **`work`/`workall` 拍数可配置** —— `ECAT2CAN_WORK_CYCLES`（默认 2000）
+- ✅ **`send` 帧间隔可配置** —— `ECAT2CAN_SEND_INTERVAL_MS`（默认 1 ms，上限 90）
+- ✅ **WKC 先判后读** —— `send`/`work`/`scan`/`fdb` 用 `wkc < expected_wkc`
+  判上行可用性后再读 `in->`；`canloop` 由 `<0` 收紧
+- ✅ **`canloop` 轮询计数被内层循环复用** —— 内层处理 CAN 反馈时复用了外层
+  轮询变量 `k`，每帧让外层多跳一次；CAN 反馈多时轮询次数被吃掉大半，
+  可能漏掉回声、把延迟测高。已改用独立变量
+- ✅ **`canloop` 命令参数 `rc` 遮蔽 `main` 返回码** —— 改名 `rch`
+- ✅ **`--help`/`-h` 退出码为 0**（原来返回 1，脚本里会误判失败）
+- ✅ **清理误提交的 `scripts/__pycache__/*.pyc`**（`.gitignore` 本来就该忽略它）
+- ✅ **`-Wshadow` 加入编译选项**，上面两处遮蔽就是它抓出来的
+- ✅ **HANDOFF 修正**：`info` 的 WORK_MODE 说明引用错节号（7.3 → 6.3）；
+  补充 6.5 的 LOOP_TEST 回填说明、6.7 的回显语义
+
+**上一轮（原作者）：**
 
 - ✅ **SAFE-OP 误判**（详见 6.1）
 - ✅ **`send` 第二次不发帧**（详见 6.2）
@@ -482,12 +559,12 @@ p50    528 us（不变）
 
 | 优先级 | 事项 | 说明 |
 |---|---|---|
-| ⭐⭐⭐ | **`info` 加从站停滞检测** | 连续 N 拍 `in->seq` 不变 → 从站应用层卡住。成本 1 次比较 |
-| ⭐⭐ | **`send`/`work` 加 seq 回显校验** | `in->seq` 应该等于上一拍的 `out->seq`，不等说明 PDO 错位 |
-| ⭐⭐ | **`work` 的 cycles 可配置** | 现在硬编码 2000。建议 `ECAT2CAN_WORK_CYCLES` 环境变量 |
-| ⭐ | **`ECAT2CAN_SEND_INTERVAL_MS`** | 现在 `send` 固定 1 kHz，低速周期发送需要这个 |
-| ⭐ | **`isolcpus` + PREEMPT_RT 实验** | 残余 0.127% 丢帧的可能优化方向 |
-| — | **`looplat` 的 load 估算偏保守** | 实测 7 帧/拍才 0.62%，估算说 8 帧就饱和 |
+| ⭐⭐ | **WKC 异常路径的实机注入测试** | 本机只有 1 个从站、连接稳定，`wkc < expected` 的错误分支没有实机触发过。可拔网线/断电制造，或用故障从站 |
+| ⭐⭐ | **多从站命令实机验证** | `looplat2`、`canloop`（跨从站回环）需要 ≥2 块从站；本机只有 1 块，`canloop` 的改动只做了编译+代码审查 |
+| ⭐ | **`isolcpus` + PREEMPT_RT 实验** | 残余丢帧的可能优化方向 |
+| ⭐ | **`bench`/`looplat` 被 Ctrl+C 提前中断时，统计分母仍用计划拍数** | 只影响中断场景的百分比显示，不影响正常结果 |
+| ⭐ | **`bench_lat` 里 `misses` 计数逻辑有误且未使用** | 当前 `(void)misses` 屏蔽；将来若要输出丢帧率需先修 |
+| — | **`looplat` 的 load 估算偏保守** | 估算按 120 µs/帧；实测 7 帧/拍 0.62%、8 帧/拍饱和，方向一致，暂不动 |
 
 ### 9.3 硬件侧已知问题（不属于本工具，但测试会遇到）
 
@@ -495,6 +572,29 @@ p50    528 us（不变）
 |---|---|
 | **某块 ECAN-Lite 的 CAN0 收发器损坏** | TEC 饱和、彻底不能用；CAN1/2/3 正常 |
 | **某块板的 PHY0 地址被 strap 成 0** | 不影响 EtherCAT 数据，但 LED 行为异常 |
+
+### 9.4 2026-11-01 接管维护实机记录（供后续对比）
+
+**本机环境：** CachyOS，内核 7.3.0-5-cachyos，命令执行在 DSH 沙箱内。
+**从站：** 1 个（`ECAT_Device Man=0x00000001 ID=0x00000001 Rev=0x1`），
+`enp3s0` 直连，CAN0↔CAN2 用线短接（回环帧出现在 **CAN0** 通道）。
+**验证方式：** `make`（含 `-Wshadow`）零警告；硬件命令需 `make setcap`。
+
+| 项目 | 实测结果 |
+|---|---|
+| `info`（3~8 s） | 往返 60~108 µs，WKC 全部 3/3，状态 OP，AL=0；无停滞误报 |
+| `loop 300` | 299 次比对全部通过 |
+| `send` 20/100 帧 | WKC 全满；`seq 回显校验` **19/19、99/99 全部一致 ✅** |
+| `ECAT2CAN_SEND_INTERVAL_MS=50` | 2 帧总耗时 134 ms，间隔生效 |
+| `work`/`workall`（`WORK_CYCLES=100/50`） | 回显校验 99/99、49/49 全部一致 ✅ |
+| `looplat 0 2` @`chrt -f 80` | **3000/3000 样本**，p50 394 µs，p99 522 µs，σ 29 µs，内容回读无位错 |
+| `rt 5 host` @`chrt -f 80` | 0 次截止期错失，σ 7.4 µs |
+| ASan+UBSan 跑 info/loop/send/work/workall/scan | 无 sanitizer 报告 |
+
+**⚠️ 环境注意：** 同一台机器上，**不套 `chrt -f 80` 时实时性数据完全不可用**
+（`rt host` 错失 33.8%、σ 2.1 ms，`looplat` 只有 6.5% 样本成功）——
+这是沙箱/宿主 CPU 调度器造成的，不是工具或从站问题。
+**任何实时性结论都必须带调度策略一起看（`chrt -p $$`）。**
 
 ---
 
@@ -512,7 +612,11 @@ p50    528 us（不变）
    │     0x0016 = 邮箱配置
    │     0x001D = 输出配置   0x001E = 输入配置
    │     0x0024 = FMMU 配置
-   └─ WKC 不满 → 有未枚举的从站
+   ├─ WKC 不满 → 有未枚举的从站
+   └─ 出现「从站应用层疑似停滞」告警
+         → WKC 满但上行 seq 100 拍不变：从站应用/PDI 卡死
+         → 对照 WKC/状态：若 WKC 也不满，先查 EtherCAT 链路（不是应用层问题）
+         → 从站恢复后 info 会打印「已恢复」
 ```
 
 ### 10.2 CAN 发不出去
@@ -558,6 +662,10 @@ chrt -p $$
 chrt -f 80 ./build/ecat2can_master enp3s0 rt 10 host
 ```
 
+如果 `chrt -f 80` 之后仍然很差，再怀疑**容器/cgroup CPU 配额**：
+在受限容器里 `rt host` 也可能出现几十 % 的截止期错失（实测过 33.8%），
+这属于执行环境问题，不代表工具或从站有问题（详见 9.4）。
+
 ---
 
 ## 11. Git 与发布
@@ -578,10 +686,11 @@ docs: 更新 XXX 文档
 ```
 
 **提交前自查清单：**
-- [ ] `make` 无新警告（`-Wall -Wextra`）
-- [ ] `--help` 与实际命令一致
+- [ ] `cmake --build` 无新警告（`-Wall -Wextra -Wshadow`）
+- [ ] `--help` 与实际命令一致（新增环境变量也要写进 usage）
 - [ ] `docs/guide/COMMANDS.md` 同步更新
-- [ ] 实测跑过至少 `info` / `scan` / `send`
+- [ ] 实测跑过至少 `info` / `loop` / `send` / `work`（本机没有从站时至少跑 `--help`、`rt host`）
+- [ ] 实时性相关改动要带 `chrt -f 80` 复测（否则数据不可信，见 9.4）
 - [ ] 没有把调试用的 printf 留在关键路径上
 
 ---
@@ -603,14 +712,16 @@ sudo nmcli dev set enp3s0 managed no
 # ---- 发 CAN ----
 ./build/ecat2can_master enp3s0 send 2 0x123 11 22
 ECAT2CAN_SEND_COUNT=100 ./build/ecat2can_master enp3s0 send 2 0x123 11 22
+ECAT2CAN_SEND_INTERVAL_MS=10 ./build/ecat2can_master enp3s0 send 2 0x123 11 22   # 10ms/帧
 ./build/ecat2can_master enp3s0 work 2 0x123 11 22 33 44 55 66 77 88
+ECAT2CAN_WORK_CYCLES=500 ./build/ecat2can_master enp3s0 work 2 0x123 11 22        # 只压 500 拍
 ./build/ecat2can_master enp3s0 workall 0x123 11 22
 
 # ---- 收 CAN ----
 ./build/ecat2can_master enp3s0 fdb 20000
 
-# ---- 延迟 ----
-./build/ecat2can_master enp3s0 looplat 0 2                 # 30s @1kHz
+# ---- 延迟（实时性结论必须带调度策略）----
+chrt -f 80 ./build/ecat2can_master enp3s0 looplat 0 2      # 30s @1kHz（推荐）
 ./build/ecat2can_master enp3s0 looplat 0 2 15 1000 4       # 15s + 负载
 ./build/ecat2can_master enp3s0 canloop 2 0 2 2             # 跨通道
 ./build/ecat2can_master enp3s0 looplat2 1,2 0 2            # 多从站

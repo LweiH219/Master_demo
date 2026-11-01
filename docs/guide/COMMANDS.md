@@ -40,6 +40,10 @@ sudo setcap cap_net_raw,cap_net_admin+eip build/ecat2can_master
 build/ecat2can_master <网卡> info
 ```
 
+`info` 进 OP 后持续刷新，重点看 `WKC 3/3`、`状态 0x08 (OP)`、`AL=0x0000`。
+从站应用层停滞时（上行 seq 连续 100 拍不变）会打印告警，恢复后自动提示。
+输出重定向到文件时改为一行一条，适合留日志。
+
 ### 2. 验证 PDO 回环
 
 ```bash
@@ -74,7 +78,7 @@ build/ecat2can_master enp3s0 send 3 0x123 11 22 33 44 55 66 77 88
 输出样例：
 
 ```text
-SEND：通道 3  ID 0x123  DLC 8  data = 11 22 33 44 55 66 77 88  共 1 帧
+SEND：通道 3  ID 0x123  DLC 8  data = 11 22 33 44 55 66 77 88  共 1 帧，间隔 1 ms
   第   1 帧  往返  55 us  WKC 3/3  从站状态 0x00  本拍从 CAN 收到 0 帧
 完成：1/1 帧 WKC 正常（从站在这些拍里共收到 0 帧 CAN 报文）
 ```
@@ -85,6 +89,9 @@ SEND：通道 3  ID 0x123  DLC 8  data = 11 22 33 44 55 66 77 88  共 1 帧
 >
 > 另外，输出里的"本拍从 CAN 收到 N 帧"是**接收**指标（从站这一拍从总线上
 > 收到了几帧），不是发送计数。
+>
+> **WKC 未满的拍**会打印"过程数据不完整，本拍上行不可用"并跳过——不会拿
+> 陈旧上行数据冒充结果。
 
 #### 多帧 `send` + `ECAT2CAN_SEND_COUNT`
 
@@ -98,6 +105,17 @@ ECAT2CAN_SEND_COUNT=100 build/ecat2can_master enp3s0 send 3 0x123 11 22 33 44 55
 ECAT2CAN_SEND_COUNT=15000 build/ecat2can_master enp3s0 send 3 0x123 11 22
 ```
 
+多帧时会自动做 **seq/command 回显校验**：本拍上行应当等于上一拍下发，
+结束时打印汇总。输出末尾类似：
+
+```text
+完成：100/100 帧 WKC 正常（从站在这些拍里共收到 98 帧 CAN 报文）
+  seq 回显校验：99 拍全部与上一拍下发一致 ✅（PDO 对齐正常）
+```
+
+不一致说明上下行 PDO 错位或主从不在同一逻辑周期；老固件如果不回显 seq
+也可能出现，属正常现象。
+
 配合另一台 CAN 分析仪观察：
 
 ```bash
@@ -108,14 +126,31 @@ candump can0
 ECAT2CAN_SEND_COUNT=100 build/ecat2can_master enp3s0 send 3 0x123 11 22 33 44 55 66 77 88
 ```
 
+#### 帧间隔 `ECAT2CAN_SEND_INTERVAL_MS`
+
+```bash
+# 每 10 ms 发一帧（100 Hz），适合低速周期发送
+ECAT2CAN_SEND_INTERVAL_MS=10 ECAT2CAN_SEND_COUNT=100 \
+    build/ecat2can_master enp3s0 send 3 0x123 11 22
+```
+
+默认 1 ms（1 kHz）；`0` 表示不等待（能发多快发多快）。
+最大 90 ms —— 从站 SM 看门狗默认 100 ms，再慢从站会掉出 OP。
+
 #### 压测 `work`
 
-`work` 固定发 2000 轮（约 2 秒、1 kHz），只打印前几轮，用来压测和检查长时稳定性：
+`work` 默认发 2000 拍（约 2 秒、1 kHz），只打印前几轮，用来压测和检查长时稳定性。
+拍数用 `ECAT2CAN_WORK_CYCLES` 调整（`workall` 同样生效）：
 
 ```bash
 build/ecat2can_master <网卡> work <通道> <标准ID> <字节0> ... <字节7>
 build/ecat2can_master enp3s0 work 3 0x123 11 22 33 44 55 66 77 88
+
+# 只压 500 拍（约 0.5 秒）
+ECAT2CAN_WORK_CYCLES=500 build/ecat2can_master enp3s0 work 3 0x123 11 22
 ```
+
+结束时同样会打印 `seq 回显校验` 汇总；WKC 未满的拍会单独提示且不参与校验。
 
 ### 5. 只读反馈
 
@@ -150,15 +185,32 @@ build/ecat2can_master <网卡> looplat 2 3 30 1000 0
 build/motor_pos <网卡> --motor gm6020 --ch 3 --id 1 --monitor
 ```
 
+## 环境变量
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `ECAT2CAN_SLAVE` | 1 | 操作第 N 个从站 |
+| `ECAT2CAN_SCAN_RETRY` | 6 | 启动扫描重试次数（每轮 ~400 ms）|
+| `ECAT2CAN_CH` | 3 | 默认 CAN 通道 |
+| `ECAT2CAN_SEND_COUNT` | 1 | `send` 发帧数（1~1000000）|
+| `ECAT2CAN_SEND_INTERVAL_MS` | 1 | `send` 帧间隔毫秒（0~90，0=不等待）|
+| `ECAT2CAN_WORK_CYCLES` | 2000 | `work`/`workall` 拍数（1~1000000）|
+| `ECAT2CAN_PROBE_CSV` | — | `probe` 的 CSV 输出路径 |
+| `ECAT2CAN_DUMP_LAYOUT` | — | 打印 PDO 字节布局后退出 |
+
+非法值（非整数/越界）会打印一行提示并退回默认值，不会静默截断。
+
 ## 功能查找
 
 | 目标 | 命令 |
 |---|---|
 | 确认从站是否在线 | `info` |
+| 判断从站应用层是否卡死 | `info`（停滞告警） |
 | 验证 192 字节 PDO | `loop` |
 | 查找 CAN 设备所在通道 | `scan` |
 | 主站向 CAN 发**单帧**（逐帧打印细节） | `send` |
-| 主站向 CAN 连续发帧 / 压测 | `work`（2000 帧） / `workall`（四路各一帧）|
+| 主站向 CAN 连续发帧 / 压测 | `work`（默认 2000 拍）/ `workall`（四路各一帧）|
+| 校验上下行 PDO 对齐（seq 回显） | `send` / `work`（≥2 拍时自动）|
 | 查看 CAN 反馈 | `fdb` |
 | 测量 EtherCAT/CAN 性能 | `bench` |
 | 测量主机调度 | `rt ... host` |
@@ -168,7 +220,7 @@ build/motor_pos <网卡> --motor gm6020 --ch 3 --id 1 --monitor
 | 读取 ESC 寄存器 | `regs` |
 | 观察 DJI 电机反馈 | `motor_pos --monitor` |
 
-完整参数以程序帮助为准：
+完整参数以程序帮助为准（`--help`/`-h` 退出码为 0）：
 
 ```bash
 build/ecat2can_master --help

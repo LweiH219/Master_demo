@@ -39,13 +39,15 @@ add_executable(ecat2can_master
 )
 target_include_directories(ecat2can_master PRIVATE src)
 target_link_libraries(ecat2can_master PRIVATE soem m)
-target_compile_options(ecat2can_master PRIVATE -Wall -Wextra)
+# -Wshadow：维护时靠它抓到过两处真实的变量遮蔽（canloop 的轮询计数被内层
+# 循环复用、命令参数 rc 遮蔽 main 的返回码），固定开启防止回归。
+target_compile_options(ecat2can_master PRIVATE -Wall -Wextra -Wshadow)
 
 if(BUILD_DJI_MOTOR_TEST)
   add_executable(motor_pos src/motor_pos.c src/motor_control.c)
   target_include_directories(motor_pos PRIVATE src)
   target_link_libraries(motor_pos PRIVATE soem m)
-  target_compile_options(motor_pos PRIVATE -Wall -Wextra)
+  target_compile_options(motor_pos PRIVATE -Wall -Wextra -Wshadow)
 endif()
 
 # ---- 安装 ---------------------------------------------------------------

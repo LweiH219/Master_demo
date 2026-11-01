@@ -67,8 +67,12 @@ build/ecat2can_master <网卡> send 0 0x123 11 22 33 44 55 66 77 88
 # 连发多帧（单帧太快，candump 和指示灯都难捕捉，连发才看得清）
 ECAT2CAN_SEND_COUNT=100 build/ecat2can_master <网卡> send 0 0x123 11 22
 
-# 压测：连续 2000 帧（约 2 秒）
+# 低速周期发送：每 10 ms 一帧（默认 1 ms）
+ECAT2CAN_SEND_INTERVAL_MS=10 ECAT2CAN_SEND_COUNT=100 build/ecat2can_master <网卡> send 0 0x123 11 22
+
+# 压测：默认连续 2000 拍（约 2 秒），拍数可配
 build/ecat2can_master <网卡> work 0 0x123 11 22 33 44 55 66 77 88
+ECAT2CAN_WORK_CYCLES=500 build/ecat2can_master <网卡> work 0 0x123 11 22
 
 # 查看反馈
 build/ecat2can_master <网卡> fdb 100
