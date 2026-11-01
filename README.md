@@ -85,6 +85,7 @@ build/motor_pos --help
 
 | 需求                                      | 文档                                                              |
 | ----------------------------------------- | ----------------------------------------------------------------- |
+| **★★ 接手维护（先读这篇）**               | **[`HANDOFF.md`](HANDOFF.md)**                                   |
 | 浏览完整文档分类                          | [`docs/README.md`](docs/README.md)                               |
 | 快速查命令和推荐测试顺序                  | [`docs/guide/COMMANDS.md`](docs/guide/COMMANDS.md)               |
 | 理解目录、依赖和测试分层                  | [`docs/design/ARCHITECTURE.md`](docs/design/ARCHITECTURE.md)     |

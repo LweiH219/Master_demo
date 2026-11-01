@@ -1973,7 +1973,9 @@ static void usage(const char *prog)
            "  info                    进 OP，打印从站信息并周期刷新（Ctrl+C 退出）\n"
            "  loop [次数]             LOOP_TEST，192 字节往返一致性校验（默认 1000）\n"
            "  scan [次数]             ★多通道扫描：只看不发，统计各路收帧数与出现过的 ID\n"
-           "  work <通道> <id> [b0..b7]  WORK_MODE，在指定通道以 1 kHz 下发一帧 CAN\n"
+           "  send <通道> <id> [b0..b7]  ★发 1 帧并逐帧打印往返/WKC/状态/收到帧数\n"
+           "                         帧数用 ECAT2CAN_SEND_COUNT=N 控制（默认 1）\n"
+           "  work <通道> <id> [b0..b7]  WORK_MODE，固定 2000 拍（1 kHz）压测\n"
            "  workall <id> [b0..b7]   ★在 4 个通道各发一帧（同一拍 PDO）\n"
            "  bench [次数] [通道]     ★性能基准：EtherCAT 往返 / 循环抖动 / CAN 吞吐\n"
            "  rt [秒数] [通道|host]   ★实时性合格性测试：直方图 / 截止期错失 / 环境诊断\n"
@@ -1985,6 +1987,10 @@ static void usage(const char *prog)
            "                         例：looplat 2 3              静默基线\n"
            "                             looplat 2 3 30 1000 4    4 帧/拍 ≈ 60%% 负载\n"
            "                             looplat 2 3 30 1000 8    8 帧/拍 ≈ 108%% 饱和\n"
+           "  looplat2 <从站列表> <tx> <rx> [秒数] [Hz] [负载]\n"
+           "                         ★多从站同时回环；列表写 1,2 或 1-3\n"
+           "  canloop <发从站> <发通道> <收从站> <收通道> [秒数] [Hz]\n"
+           "                         ★跨从站 CAN 回环（A 站发、B 站收）\n"
            "  fdb  [次数]             ONLY_FDB，只读 CAN 反馈（默认 20）\n"
            "  reset                   HW_RESET，让从站复位\n"
            "\n"
@@ -1994,6 +2000,8 @@ static void usage(const char *prog)
            "\n"
            "示例:\n"
            "  %s enp3s0 scan 3000                        # 先扫一遍，看设备挂在哪一路\n"
+           "  %s enp3s0 send 2 0x123 11 22 33 44 55 66 77 88   # 单帧\n"
+           "  ECAT2CAN_SEND_COUNT=100 %s enp3s0 send 2 0x123 11 22   # 连发 100 帧\n"
            "  %s enp3s0 work 0 0x123 11 22 33 44 55 66 77 88\n"
            "  %s enp3s0 workall 0x1FF 03 E8 00 00 00 00 00 00\n"
            "  %s enp3s0 loop\n"
@@ -2002,7 +2010,7 @@ static void usage(const char *prog)
            "  sudo nmcli dev set <网卡名> managed no\n"
            "  sudo setcap cap_net_raw,cap_net_admin+eip %s\n",
            prog, ECAT2CAN_CAN_CHANNEL_MAX, ECAT2CAN_CAN_CHANNEL_MAX,
-           prog, prog, prog, prog, prog);
+           prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char *argv[])
